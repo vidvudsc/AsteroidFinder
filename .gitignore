@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# macOS / editor
+.DS_Store
+.vscode/
+
+# Large/generated astronomy data
+data/
+demo/output/
+demo2/output/
+runs/
+outputs/
+*.fit
+*.fits
+*.fts
+*.fits.fz
+*.new
+*.axy
+*.corr
+*.rdls
+*.solved
+*.wcs
+*.match
+*.xyls
+
+# Generated media/reports outside source folders
+*.gif
+*.jpg
+*.jpeg
+*.png
+*.html
+
+# Keep source docs/scripts tracked explicitly; generated outputs are ignored by path above.
+!README.md
+!demo/README.md
+!demo2/README.md

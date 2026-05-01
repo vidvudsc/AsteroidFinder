@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "asteroidfinder"
+version = "0.1.0"
+description = "Python tools for real astronomical image loading, plate solving, alignment, stacking, and moving-object tracking."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "astropy>=5",
+  "astroquery>=0.4",
+  "astroalign>=2.5",
+  "numpy>=1.24",
+  "photutils>=1.9",
+  "Pillow>=10",
+  "matplotlib>=3.7",
+  "requests>=2.31",
+  "scipy>=1.10",
+  "scikit-image>=0.21",
+  "sep>=1.4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+asteroidfinder = "asteroidfinder.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["asteroidfinder*"]
