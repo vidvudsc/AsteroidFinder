@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from astropy.wcs import WCS
-from PySide6.QtCore import QThreadPool, QTimer, Qt
+from PySide6.QtCore import QSize, QThreadPool, QTimer, Qt
 from PySide6.QtGui import QAction, QPalette, QColor
 from PySide6.QtWidgets import (
     QApplication,
@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QSlider,
     QSpinBox,
     QSplitter,
+    QStyle,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -87,8 +88,9 @@ class MainWindow(QMainWindow):
         self.observatory_code = QLineEdit(self.session.settings.observatory_code)
         self.invert_check = QCheckBox("Invert")
         self.blink_slider = QSlider(Qt.Orientation.Horizontal)
-        self.blink_slider.setRange(100, 2000)
-        self.blink_slider.setValue(600)
+        self.blink_slider.setRange(1, 20)
+        self.blink_slider.setValue(15)
+        self.blink_slider.setToolTip("Blink speed: left is slower, right is faster")
 
         self._build_ui()
         self._wire_actions()
@@ -118,16 +120,11 @@ class MainWindow(QMainWindow):
         panel.setObjectName("SidePanel")
         layout = QVBoxLayout(panel)
 
-        browse_input = QPushButton("Import")
-        browse_input.clicked.connect(self.import_images)
         browse_output = QPushButton("Output")
         browse_output.clicked.connect(self.choose_output_folder)
 
-        row = QHBoxLayout()
-        row.addWidget(self.input_edit)
-        row.addWidget(browse_input)
         layout.addWidget(QLabel("Input Images"))
-        layout.addLayout(row)
+        layout.addWidget(self.input_edit)
 
         out_row = QHBoxLayout()
         out_row.addWidget(self.output_edit)
@@ -168,23 +165,23 @@ class MainWindow(QMainWindow):
         controls = QHBoxLayout()
         import_button = QPushButton("Import Images")
         import_button.clicked.connect(self.import_images)
-        previous = QPushButton("Prev")
+        previous = _icon_button(self, QStyle.StandardPixmap.SP_MediaSkipBackward, "Previous frame")
         previous.clicked.connect(lambda: self._step_frame(-1))
-        play = QPushButton("Play")
-        play.clicked.connect(self.toggle_blink)
-        next_button = QPushButton("Next")
+        self.play_button = _icon_button(self, QStyle.StandardPixmap.SP_MediaPlay, "Start blink")
+        self.play_button.clicked.connect(self.toggle_blink)
+        next_button = _icon_button(self, QStyle.StandardPixmap.SP_MediaSkipForward, "Next frame")
         next_button.clicked.connect(lambda: self._step_frame(1))
-        fit_button = QPushButton("Fit")
+        fit_button = _icon_button(self, QStyle.StandardPixmap.SP_TitleBarNormalButton, "Fit image to view")
         fit_button.clicked.connect(self.viewer.fit_to_view)
         self.invert_check.toggled.connect(self.viewer.set_inverted)
         controls.addWidget(import_button)
         controls.addStretch(1)
         controls.addWidget(previous)
-        controls.addWidget(play)
+        controls.addWidget(self.play_button)
         controls.addWidget(next_button)
         controls.addWidget(fit_button)
         controls.addWidget(self.invert_check)
-        controls.addWidget(QLabel("Blink"))
+        controls.addWidget(QLabel("Speed"))
         controls.addWidget(self.blink_slider)
         layout.addLayout(controls)
         layout.addWidget(self.viewer, 1)
@@ -226,7 +223,7 @@ class MainWindow(QMainWindow):
         return panel
 
     def _wire_actions(self) -> None:
-        self.blink_slider.valueChanged.connect(lambda value: self._blink_timer.setInterval(value))
+        self.blink_slider.valueChanged.connect(lambda _: self._blink_timer.setInterval(self._blink_interval_ms()))
 
     def import_images(self) -> None:
         suffixes = " ".join(f"*{suffix}" for suffix in sorted(FITS_EXTENSIONS))
@@ -306,7 +303,7 @@ class MainWindow(QMainWindow):
         self._start_worker("plate solve", solve_all)
 
     def run_alignment(self) -> None:
-        paths = self._require_paths(prefer_solved=True, require_same_shape=True)
+        paths = self._require_paths(prefer_solved=True)
         if not paths:
             return
         self._start_worker("alignment", align_images, paths, output_dir=self._output_dir() / "aligned", crop_overlap=False)
@@ -318,7 +315,7 @@ class MainWindow(QMainWindow):
         self._start_worker("tracking", track_moving_objects, paths, sigma=self.detect_sigma.value(), min_detections=self.min_detections.value())
 
     def run_full_workflow(self) -> None:
-        paths = self._require_paths(require_same_shape=True)
+        paths = self._require_paths()
         if not paths:
             return
         self._start_worker(
@@ -359,8 +356,19 @@ class MainWindow(QMainWindow):
     def toggle_blink(self) -> None:
         if self._blink_timer.isActive():
             self._blink_timer.stop()
+            self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+            self.play_button.setToolTip("Start blink")
         else:
-            self._blink_timer.start(self.blink_slider.value())
+            self._blink_timer.start(self._blink_interval_ms())
+            self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
+            self.play_button.setToolTip("Pause blink")
+
+    def _blink_interval_ms(self) -> int:
+        speed = self.blink_slider.value()
+        slow_ms = 2000
+        fast_ms = 90
+        fraction = (speed - self.blink_slider.minimum()) / (self.blink_slider.maximum() - self.blink_slider.minimum())
+        return int(slow_ms - fraction * (slow_ms - fast_ms))
 
     def _start_worker(self, name: str, fn: Any, *args: Any, **kwargs: Any) -> None:
         worker = FunctionWorker(name, fn, *args, **kwargs)
@@ -718,6 +726,15 @@ def _size_text(frame: FrameInfo) -> str:
     if frame.width is None or frame.height is None:
         return ""
     return f"{frame.width} x {frame.height}"
+
+
+def _icon_button(window: QWidget, icon: QStyle.StandardPixmap, tooltip: str) -> QPushButton:
+    button = QPushButton()
+    button.setIcon(window.style().standardIcon(icon))
+    button.setIconSize(QSize(18, 18))
+    button.setFixedSize(34, 30)
+    button.setToolTip(tooltip)
+    return button
 
 
 def _short_error(details: str) -> str:
