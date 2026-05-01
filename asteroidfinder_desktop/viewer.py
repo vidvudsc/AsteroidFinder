@@ -58,35 +58,62 @@ class FitsViewer(QGraphicsView):
             self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
             self._zoom = 1.0
 
-    def show_track_overlay(self, points: list[tuple[float, float]], label: str, color: str = "#38bdf8") -> None:
+    def show_track_overlay(
+        self,
+        points: list[tuple[float, float]],
+        label: str,
+        *,
+        mode: str = "circle",
+        current_index: int | None = None,
+        color: str = "#38bdf8",
+    ) -> None:
         if not points:
             return
         pen = QPen(QColor(color), 2.0)
         brush = QBrush(QColor(color))
-        previous = None
-        for index, (x, y) in enumerate(points):
-            marker = QGraphicsEllipseItem(QRectF(x - 5, y - 5, 10, 10))
-            marker.setPen(pen)
+
+        if mode in {"path", "both"}:
+            previous = None
+            for index, (x, y) in enumerate(points):
+                marker = QGraphicsEllipseItem(QRectF(x - 5, y - 5, 10, 10))
+                marker.setPen(pen)
+                marker.setBrush(Qt.BrushStyle.NoBrush)
+                marker.setZValue(10)
+                self._scene.addItem(marker)
+                self._overlay_items.append(marker)
+                if previous is not None:
+                    line = self._scene.addLine(previous[0], previous[1], x, y, pen)
+                    line.setZValue(9)
+                    self._overlay_items.append(line)
+                previous = (x, y)
+                if index == 0:
+                    self._add_track_label(label, x, y, color)
+            for x, y in points:
+                dot = self._scene.addEllipse(x - 1.8, y - 1.8, 3.6, 3.6, QPen(QColor(color)), brush)
+                dot.setZValue(12)
+                self._overlay_items.append(dot)
+
+        if mode in {"circle", "both"}:
+            point_index = current_index if current_index is not None and 0 <= current_index < len(points) else 0
+            x, y = points[point_index]
+            marker = QGraphicsEllipseItem(QRectF(x - 8, y - 8, 16, 16))
+            marker.setPen(QPen(QColor(color), 2.4))
             marker.setBrush(Qt.BrushStyle.NoBrush)
-            marker.setZValue(10)
+            marker.setZValue(20)
             self._scene.addItem(marker)
             self._overlay_items.append(marker)
-            if previous is not None:
-                line = self._scene.addLine(previous[0], previous[1], x, y, pen)
-                line.setZValue(9)
-                self._overlay_items.append(line)
-            previous = (x, y)
-            if index == 0:
-                text = QGraphicsTextItem(label)
-                text.setDefaultTextColor(QColor(color))
-                text.setPos(x + 7, y + 7)
-                text.setZValue(11)
-                self._scene.addItem(text)
-                self._overlay_items.append(text)
-        for x, y in points:
+            self._add_track_label(label, x, y, color)
             dot = self._scene.addEllipse(x - 1.8, y - 1.8, 3.6, 3.6, QPen(QColor(color)), brush)
-            dot.setZValue(12)
+            dot.setZValue(21)
             self._overlay_items.append(dot)
+
+    def _add_track_label(self, label: str, x: float, y: float, color: str) -> None:
+        text = QGraphicsTextItem(label)
+        text.setDefaultTextColor(QColor(color))
+        text.setPos(x + 9, y + 9)
+        text.setZValue(22)
+        self._scene.addItem(text)
+        self._overlay_items.append(text)
 
     def wheelEvent(self, event: QWheelEvent) -> None:
         factor = 1.08 if event.angleDelta().y() > 0 else 1 / 1.08

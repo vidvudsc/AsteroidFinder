@@ -5,7 +5,7 @@ from typing import Any
 
 from astropy.wcs import WCS
 from PySide6.QtCore import QThreadPool, QTimer, Qt
-from PySide6.QtGui import QAction, QPalette, QColor
+from PySide6.QtGui import QAction, QPalette, QColor, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
 
 from asteroidfinder.alignment import align_images
 from asteroidfinder.calibration import calibrate_images_with_persistent_hot_pixels
+from asteroidfinder.diagnostics import plot_track_diagnostics
 from asteroidfinder.io import load_image
 from asteroidfinder.mpc import write_detected_track_mpc
 from asteroidfinder.platesolve import solve_image
@@ -56,6 +57,7 @@ class MainWindow(QMainWindow):
         self.thread_pool.setStackSize(32 * 1024 * 1024)
         self._workers: list[FunctionWorker] = []
         self.tracks: list[Track] = []
+        self.diagnostic_paths: list[Path] = []
         self._current_frame_index = 0
         self._blink_timer = QTimer(self)
         self._blink_timer.timeout.connect(self._advance_blink)
@@ -92,6 +94,16 @@ class MainWindow(QMainWindow):
         self.alignment_output.addItem("Crop clean overlap", True)
         self.alignment_output.addItem("Keep reference canvas", False)
         self.alignment_output.setToolTip("Crop removes black no-data borders after alignment. Keep reference canvas is better for debugging.")
+        self.track_overlay_mode = QComboBox()
+        self.track_overlay_mode.addItem("Circle on current frame", "circle")
+        self.track_overlay_mode.addItem("Motion path", "path")
+        self.track_overlay_mode.addItem("Circle + path", "both")
+        self.track_overlay_mode.setToolTip("Circle marks the selected track on the current frame. Path shows the full fitted motion trail.")
+        self.track_overlay_mode.currentIndexChanged.connect(lambda _: self._draw_selected_track())
+        self.diagnostic_preview = QLabel("No movement graph")
+        self.diagnostic_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.diagnostic_preview.setMinimumHeight(180)
+        self.diagnostic_preview.setObjectName("DiagnosticPreview")
         self.invert_check = QCheckBox("Invert")
         self.blink_slider = QSlider(Qt.Orientation.Horizontal)
         self.blink_slider.setRange(1, 20)
@@ -220,6 +232,7 @@ class MainWindow(QMainWindow):
         run_menu.addAction("Plate Solve", self.run_plate_solve)
         run_menu.addAction("Align Frames", self.run_alignment)
         run_menu.addAction("Track Moving Objects", self.run_tracking)
+        run_menu.addAction("Generate Movement Graphs", self.generate_movement_graphs)
         run_menu.addAction("Full Basic Run", self.run_full_workflow)
         run_menu.addSeparator()
         run_menu.addAction("Export MPC", self.export_mpc)
@@ -252,7 +265,14 @@ class MainWindow(QMainWindow):
         self.track_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.track_table.itemSelectionChanged.connect(self._selected_track_changed)
         layout.addWidget(QLabel("Detected Tracks"))
+        layout.addWidget(self.track_overlay_mode)
         layout.addWidget(self.track_table, 1)
+        graph_row = QHBoxLayout()
+        graph_button = QPushButton("Generate Movement Graphs")
+        graph_button.clicked.connect(self.generate_movement_graphs)
+        graph_row.addWidget(graph_button)
+        layout.addLayout(graph_row)
+        layout.addWidget(self.diagnostic_preview, 1)
 
         layout.addWidget(QLabel("Log"))
         layout.addWidget(self.log, 1)
@@ -351,6 +371,12 @@ class MainWindow(QMainWindow):
             return
         self._start_worker("tracking", track_moving_objects, paths, sigma=self.detect_sigma.value(), min_detections=self.min_detections.value())
 
+    def generate_movement_graphs(self) -> None:
+        if not self.tracks:
+            self._error("No tracks", "Run tracking before generating movement graphs.")
+            return
+        self._start_worker("movement graphs", plot_track_diagnostics, self.tracks, self._output_dir() / "diagnostics")
+
     def run_full_workflow(self) -> None:
         paths = self._require_paths()
         if not paths:
@@ -441,10 +467,14 @@ class MainWindow(QMainWindow):
         if name == "tracking":
             self.tracks = list(result)  # type: ignore[arg-type]
             self._populate_tracks()
+            if self.tracks:
+                self.generate_movement_graphs()
         elif name == "basic workflow":
             tracks = getattr(result, "tracks", [])
             self.tracks = list(tracks)
             self._populate_tracks()
+            if self.tracks:
+                self.generate_movement_graphs()
         elif name == "alignment":
             aligned_dir = self._output_dir() / "aligned"
             mode = self.alignment_output.currentText()
@@ -456,6 +486,10 @@ class MainWindow(QMainWindow):
                 self.session.frames = [self._frame_info(path) for path in solved_paths]
                 self._populate_frames()
                 self._show_frame(0, keep_view=False)
+        elif name == "movement graphs":
+            self.diagnostic_paths = [Path(path) for path in result] if isinstance(result, list) else []
+            self._log(f"Movement graphs written to {self._output_dir() / 'diagnostics'}")
+            self._show_selected_diagnostic()
 
     def _forget_worker(self, worker: FunctionWorker) -> None:
         if worker in self._workers:
@@ -504,10 +538,53 @@ class MainWindow(QMainWindow):
         index = rows[0].row()
         if index >= len(self.tracks):
             return
+        self._draw_selected_track()
+        self._show_selected_diagnostic()
+
+    def _draw_selected_track(self) -> None:
+        index = self._selected_track_index()
+        if index is None:
+            return
         track = self.tracks[index]
         points = [(det.source.x, det.source.y) for det in track.detections]
+        current_detection_index = next(
+            (det_index for det_index, det in enumerate(track.detections) if det.frame_index == self._current_frame_index),
+            None,
+        )
         self.viewer.clear_overlays()
-        self.viewer.show_track_overlay(points, f"AF{index + 1:04d}")
+        self.viewer.show_track_overlay(
+            points,
+            f"AF{index + 1:04d}",
+            mode=str(self.track_overlay_mode.currentData()),
+            current_index=current_detection_index,
+        )
+
+    def _show_selected_diagnostic(self) -> None:
+        index = self._selected_track_index()
+        if index is None or index >= len(self.diagnostic_paths):
+            self.diagnostic_preview.setText("No movement graph")
+            self.diagnostic_preview.setPixmap(QPixmap())
+            return
+        pixmap = QPixmap(str(self.diagnostic_paths[index]))
+        if pixmap.isNull():
+            self.diagnostic_preview.setText("Graph could not be loaded")
+            return
+        self.diagnostic_preview.setText("")
+        self.diagnostic_preview.setPixmap(
+            pixmap.scaled(
+                self.diagnostic_preview.width(),
+                self.diagnostic_preview.height(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+    def _selected_track_index(self) -> int | None:
+        rows = self.track_table.selectionModel().selectedRows()
+        if not rows:
+            return None
+        index = rows[0].row()
+        return index if 0 <= index < len(self.tracks) else None
 
     def _show_frame(self, index: int, *, keep_view: bool = True) -> None:
         if not self.session.frames:
@@ -517,6 +594,7 @@ class MainWindow(QMainWindow):
         self.viewer.load_path(frame.path, keep_view=keep_view)
         self.frame_table.selectRow(self._current_frame_index)
         self._update_plate_info(Path(frame.path))
+        self._draw_selected_track()
 
     def _step_frame(self, delta: int) -> None:
         if self.session.frames:
@@ -751,6 +829,12 @@ def apply_dark_theme(app: QApplication) -> None:
         }
         QProgressBar::chunk {
             background: #2a8cdc;
+        }
+        QLabel#DiagnosticPreview {
+            background: #070b11;
+            border: 1px solid #26364a;
+            border-radius: 4px;
+            color: #9fb2c5;
         }
         #MutedText {
             color: #9fb2c5;
