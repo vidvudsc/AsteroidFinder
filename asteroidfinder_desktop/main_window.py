@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
-    QScrollArea,
+    QSizePolicy,
     QSlider,
     QSpinBox,
     QSplitter,
@@ -1092,6 +1092,20 @@ def _range_with_padding(values: list[float], padding_fraction: float = 0.12) -> 
     return low - pad, high + pad
 
 
+def _aspect_rect(rect: QRectF, data_width: float, data_height: float) -> QRectF:
+    if data_width <= 0 or data_height <= 0 or rect.width() <= 0 or rect.height() <= 0:
+        return rect
+    data_aspect = data_width / data_height
+    rect_aspect = rect.width() / rect.height()
+    if rect_aspect > data_aspect:
+        width = rect.height() * data_aspect
+        left = rect.left() + (rect.width() - width) / 2.0
+        return QRectF(left, rect.top(), width, rect.height())
+    height = rect.width() / data_aspect
+    top = rect.top() + (rect.height() - height) / 2.0
+    return QRectF(rect.left(), top, rect.width(), height)
+
+
 class TrackChartWidget(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1106,7 +1120,7 @@ class TrackChartWidget(QWidget):
         self.zoom = 100
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setMinimumSize(self.sizeHint())
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
     def set_track(
         self,
@@ -1124,14 +1138,11 @@ class TrackChartWidget(QWidget):
         self.update()
 
     def set_zoom(self, zoom: int) -> None:
-        self.zoom = max(45, min(300, zoom))
-        self.setMinimumSize(self.sizeHint())
-        self.updateGeometry()
+        self.zoom = max(25, min(500, zoom))
         self.update()
 
     def sizeHint(self) -> QSize:
-        scale = max(self.zoom, 40) / 100.0
-        return QSize(int(1120 * scale), int(760 * scale))
+        return QSize(1120, 760)
 
     def paintEvent(self, event: object) -> None:  # noqa: N802
         painter = QPainter(self)
@@ -1224,6 +1235,11 @@ class TrackChartWidget(QWidget):
         else:
             min_x, max_x = 0.0, float(self.frame_size[0])
             min_y, max_y = 0.0, float(self.frame_size[1])
+        center_x, center_y = self._selected_xy(points)
+        min_x, max_x = self._zoomed_range(min_x, max_x, center_x)
+        min_y, max_y = self._zoomed_range(min_y, max_y, center_y)
+        plot = _aspect_rect(plot, max_x - min_x, max_y - min_y)
+        self._draw_tick_labels(painter, plot, min_x, max_x, min_y, max_y)
 
         def map_point(x: float, y: float) -> QPointF:
             px = plot.left() + (x - min_x) / max(max_x - min_x, 1e-9) * plot.width()
@@ -1238,6 +1254,8 @@ class TrackChartWidget(QWidget):
         fitted_end = map_point(fit_x[0] * frame_high + fit_x[1], fit_y[0] * frame_high + fit_y[1])
 
         mapped = [map_point(x, y) for _, x, y, _ in points]
+        painter.save()
+        painter.setClipRect(plot.adjusted(-1, -1, 1, 1))
         painter.setPen(QPen(QColor("#2a8cdc"), 2.5))
         for start, end in zip(mapped, mapped[1:]):
             painter.drawLine(start, end)
@@ -1259,6 +1277,7 @@ class TrackChartWidget(QWidget):
             painter.setPen(QColor("#dbe7f3"))
             painter.drawText(QPointF(point.x() + 8, point.y() - 8), f"F{int(frame)}")
             self._hit_points.append((point, idx))
+        painter.restore()
 
         self._draw_axis_labels(painter, plot, f"x {min_x:.1f}..{max_x:.1f}", f"y {min_y:.1f}..{max_y:.1f}")
 
@@ -1271,8 +1290,11 @@ class TrackChartWidget(QWidget):
         frames = [frame for frame, *_ in points]
         values = [point[value_index] for point in points]
         min_f, max_f = _range_with_padding(frames, 0.08)
+        selected_frame = points[min(self.selected_offset or 0, len(points) - 1)][0]
+        min_f, max_f = self._zoomed_range(min_f, max_f, selected_frame)
         min_v, max_v = _range_with_padding(values)
         fit = _linear_fit([(frame, value) for frame, value in zip(frames, values)])
+        self._draw_tick_labels(painter, plot, min_f, max_f, min_v, max_v)
 
         def map_point(frame: float, value: float) -> QPointF:
             px = plot.left() + (frame - min_f) / max(max_f - min_f, 1e-9) * plot.width()
@@ -1280,6 +1302,8 @@ class TrackChartWidget(QWidget):
             return QPointF(px, py)
 
         mapped = [map_point(frame, value) for frame, value in zip(frames, values)]
+        painter.save()
+        painter.setClipRect(plot.adjusted(-1, -1, 1, 1))
         painter.setPen(QPen(color, 2))
         for start, end in zip(mapped, mapped[1:]):
             painter.drawLine(start, end)
@@ -1297,6 +1321,7 @@ class TrackChartWidget(QWidget):
                 painter.drawEllipse(point, 8.0, 8.0)
                 painter.setBrush(QBrush(color))
                 painter.setPen(QPen(QColor("#ffffff"), 1))
+        painter.restore()
 
         residuals = [value - (fit[0] * frame + fit[1]) for frame, value in zip(frames, values)]
         rms = (sum(value * value for value in residuals) / len(residuals)) ** 0.5 if residuals else 0.0
@@ -1312,11 +1337,45 @@ class TrackChartWidget(QWidget):
         painter.drawText(QPointF(plot.left(), plot.bottom() + 22), x_text)
         painter.drawText(QPointF(plot.left() - 4, plot.top() - 10), y_text)
 
+    def _draw_tick_labels(self, painter: QPainter, plot: QRectF, min_x: float, max_x: float, min_y: float, max_y: float) -> None:
+        painter.setPen(QColor("#6f8195"))
+        font = QFont()
+        font.setPointSize(8)
+        painter.setFont(font)
+        for i in range(3):
+            fraction = i / 2
+            x = plot.left() + plot.width() * fraction
+            y = plot.bottom() - plot.height() * fraction
+            x_value = min_x + (max_x - min_x) * fraction
+            y_value = min_y + (max_y - min_y) * fraction
+            painter.drawText(QPointF(x - 16, plot.bottom() + 12), f"{x_value:.0f}")
+            painter.drawText(QPointF(plot.left() - 42, y + 4), f"{y_value:.0f}")
+
+    def _selected_xy(self, points: list[tuple[float, float, float, float]]) -> tuple[float, float]:
+        index = min(self.selected_offset or 0, len(points) - 1)
+        return points[index][1], points[index][2]
+
+    def _zoomed_range(self, low: float, high: float, center: float) -> tuple[float, float]:
+        span = max(high - low, 1e-9)
+        if self.zoom <= 100:
+            return low, high
+        visible = span * 100.0 / self.zoom
+        half = visible / 2.0
+        new_low = center - half
+        new_high = center + half
+        if new_low < low:
+            new_high += low - new_low
+            new_low = low
+        if new_high > high:
+            new_low -= new_high - high
+            new_high = high
+        return new_low, new_high
+
     def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802
         delta = event.angleDelta().y()
         if delta == 0:
             return
-        factor = 1.12 if delta > 0 else 1 / 1.12
+        factor = 1.18 if delta > 0 else 1 / 1.18
         self.set_zoom(int(self.zoom * factor))
         if self.on_zoom_changed is not None:
             self.on_zoom_changed(self.zoom)
@@ -1401,14 +1460,10 @@ class DiagnosticWindow(QDialog):
         self.chart = TrackChartWidget()
         self.chart.on_selected_offset = self._chart_selected_offset
         self.chart.on_zoom_changed = self._chart_zoom_changed
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(False)
-        self.scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.scroll.setWidget(self.chart)
         chart_tab = QWidget()
         chart_layout = QVBoxLayout(chart_tab)
         chart_layout.setContentsMargins(0, 0, 0, 0)
-        chart_layout.addWidget(self.scroll, 1)
+        chart_layout.addWidget(self.chart, 1)
 
         self.measurement_table = QTableWidget(0, 8)
         self.measurement_table.setHorizontalHeaderLabels(["Frame", "X", "Y", "SNR", "Flux", "RA", "Dec", "Residual"])
