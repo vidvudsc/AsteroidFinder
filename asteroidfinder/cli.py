@@ -61,6 +61,9 @@ def main(argv: list[str] | None = None) -> int:
     solve_p.add_argument("--scale-units", default="arcsecperpix")
     solve_p.add_argument("--index-dir", type=Path)
     solve_p.add_argument("--timeout", type=int, default=180)
+    solve_p.add_argument("--search-radius", type=float, help="RA/Dec search radius in degrees when header coordinates are present")
+    solve_p.add_argument("--downsample", type=int, default=2, help="Downsample before source extraction; use 1 to disable")
+    solve_p.add_argument("--max-sources", type=int, default=200, help="Maximum number of extracted sources to test")
 
     align_p = sub.add_parser("align", help="Align images and optionally stack them")
     align_p.add_argument("paths", nargs="+")
@@ -210,6 +213,9 @@ def _solve(paths: list[str], args: argparse.Namespace) -> int:
             scale_low=args.scale_low,
             scale_high=args.scale_high,
             scale_units=args.scale_units,
+            search_radius_deg=args.search_radius,
+            downsample=args.downsample,
+            max_sources=args.max_sources,
         )
         center = solution.wcs.pixel_to_world_values(0, 0)
         print(f"{solution.path}: solved by {solution.method}; origin ra={center[0]:.6f} dec={center[1]:.6f}")

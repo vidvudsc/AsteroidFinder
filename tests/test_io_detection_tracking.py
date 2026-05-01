@@ -32,6 +32,56 @@ def test_load_fits_color_cube_as_luminance(tmp_path: Path) -> None:
     assert np.allclose(image.data, 4)
 
 
+def test_plate_solver_uses_2d_input_and_header_hints(tmp_path: Path, monkeypatch) -> None:
+    from asteroidfinder import platesolve
+
+    path = tmp_path / "color.fit"
+    data = np.stack(
+        [
+            np.full((8, 9), 1, dtype=np.float32),
+            np.full((8, 9), 4, dtype=np.float32),
+            np.full((8, 9), 7, dtype=np.float32),
+        ]
+    )
+    header = fits.Header()
+    header["RA"] = "07 30 00.00"
+    header["DEC"] = "+50 00 00.0"
+    header["FOCALLEN"] = 635.0
+    header["XPIXSZ"] = 3.76
+    header["XBINNING"] = 1
+    fits.writeto(path, data, header)
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        solved_path = Path(cmd[cmd.index("--dir") + 1]) / f"{Path(cmd[-1]).stem}.new"
+        solved_header = fits.Header()
+        solved_header["CTYPE1"] = "RA---TAN"
+        solved_header["CTYPE2"] = "DEC--TAN"
+        solved_header["CRPIX1"] = 4.5
+        solved_header["CRPIX2"] = 4.0
+        solved_header["CRVAL1"] = 112.5
+        solved_header["CRVAL2"] = 50.0
+        solved_header["CDELT1"] = -0.00034
+        solved_header["CDELT2"] = 0.00034
+        fits.writeto(solved_path, np.zeros((8, 9), dtype=np.float32), solved_header)
+
+    monkeypatch.setattr(platesolve.shutil, "which", lambda name: "/usr/bin/solve-field")
+    monkeypatch.setattr(platesolve.subprocess, "run", fake_run)
+
+    solution = platesolve.solve_image(path, output_dir=tmp_path / "solved", timeout=30)
+
+    cmd = captured["cmd"]
+    assert solution.wcs.has_celestial
+    assert cmd[-1].endswith("-solveinput.fits")
+    assert fits.getdata(cmd[-1]).shape == (8, 9)
+    assert "--scale-low" in cmd
+    assert "--ra" in cmd and "112.50000000" in cmd
+    assert "--dec" in cmd and "50.00000000" in cmd
+    assert "--downsample" in cmd and "2" in cmd
+    assert "--objs" in cmd and "200" in cmd
+
+
 def test_detect_sources_finds_synthetic_stars() -> None:
     image = np.zeros((100, 100), dtype=np.float32)
     yy, xx = np.indices(image.shape)
