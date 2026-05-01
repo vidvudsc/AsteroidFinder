@@ -5,7 +5,9 @@ from pathlib import Path
 import numpy as np
 from astropy.io import fits
 
-from asteroidfinder.calibration import remove_hot_pixels
+from asteroidfinder.calibration import build_persistent_hot_pixel_mask, calibrate_images_with_persistent_hot_pixels, remove_hot_pixels
+from asteroidfinder.diagnostics import plot_track_diagnostics
+from asteroidfinder.doctor import recommend_index_series, run_doctor
 from asteroidfinder.detection import detect_sources
 from asteroidfinder.io import load_image, save_fits
 from asteroidfinder.mpc import write_detected_track_mpc
@@ -53,6 +55,27 @@ def test_hot_pixel_cleanup_replaces_isolated_spike() -> None:
 
     assert mask[10, 10]
     assert cleaned[10, 10] == 100
+
+
+def test_persistent_hot_pixel_mask_does_not_flag_moving_star(tmp_path: Path) -> None:
+    paths = []
+    yy, xx = np.indices((50, 50))
+    for frame in range(4):
+        image = np.full((50, 50), 100, dtype=np.float32)
+        image[8, 9] = 8000
+        star_x = 20 + frame
+        star_y = 25
+        image += 3000 * np.exp(-((xx - star_x) ** 2 + (yy - star_y) ** 2) / 2)
+        path = tmp_path / f"frame_{frame}.fits"
+        save_fits(image, path)
+        paths.append(path)
+
+    mask = build_persistent_hot_pixel_mask(paths, sigma=8, neighbor_sigma=4, min_center_neighbor_ratio=2, min_frames=3)
+    results = calibrate_images_with_persistent_hot_pixels(paths, hot_sigma=8, neighbor_sigma=4, min_center_neighbor_ratio=2, min_frames=3)
+
+    assert mask[8, 9]
+    assert not mask[25, 20]
+    assert sum(int(result.hot_pixel_mask.sum()) for result in results) == 4
 
 
 def test_aperture_photometry_measures_positive_flux() -> None:
@@ -132,3 +155,58 @@ def test_detected_track_mpc_export_uses_measured_track(tmp_path: Path) -> None:
     rows = csv_path.read_text().splitlines()
     assert rows[0].startswith("track_id,frame_index")
     assert len(rows) >= 4
+    assert ",calibrated_magzp," in rows[1]
+
+
+def test_track_diagnostics_writes_png_and_summary(tmp_path: Path) -> None:
+    paths = _synthetic_wcs_sequence(tmp_path)
+    tracks = track_moving_objects(paths, sigma=5, min_detections=3)
+
+    written = plot_track_diagnostics(tracks, tmp_path / "diag")
+
+    assert written
+    assert written[0].exists()
+    summary = (tmp_path / "diag" / "track_diagnostics.csv").read_text()
+    assert "pixel_speed" in summary
+    assert "sky_speed" in summary
+
+
+def test_doctor_reports_index_recommendation(tmp_path: Path) -> None:
+    sample = tmp_path / "sample.fits"
+    save_fits(np.zeros((100, 200), dtype=np.float32), sample)
+    index_dir = tmp_path / "indexes"
+    index_dir.mkdir()
+    (index_dir / "index-4210.fits").write_bytes(b"placeholder")
+
+    checks = run_doctor(index_dir=index_dir, sample_image=sample, scale_low=1.0, scale_high=1.5)
+    series = recommend_index_series(image_width_px=6248, scale_low=1.0, scale_high=1.5)
+
+    assert any(check.name == "astrometry index files" and check.ok for check in checks)
+    assert series == ["4210", "4211", "4212"]
+
+
+def _synthetic_wcs_sequence(tmp_path: Path) -> list[Path]:
+    paths = []
+    yy, xx = np.indices((120, 120))
+    stars = [(20, 20), (80, 30), (45, 90), (95, 95), (15, 75)]
+    for frame in range(3):
+        image = np.zeros((120, 120), dtype=np.float32) + 20
+        for x, y in stars:
+            image += 700 * np.exp(-((xx - x) ** 2 + (yy - y) ** 2) / 5)
+        image += 600 * np.exp(-((xx - (30 + frame * 5)) ** 2 + (yy - (40 + frame * 3)) ** 2) / 5)
+        header = fits.Header()
+        header["DATE-OBS"] = f"2026-01-01T00:0{frame}:00"
+        header["CTYPE1"] = "RA---TAN"
+        header["CTYPE2"] = "DEC--TAN"
+        header["CRPIX1"] = 60.0
+        header["CRPIX2"] = 60.0
+        header["CRVAL1"] = 100.0
+        header["CRVAL2"] = 20.0
+        header["CDELT1"] = -0.00028
+        header["CDELT2"] = 0.00028
+        header["FILTER"] = "r"
+        header["MAGZP"] = 25.0
+        path = tmp_path / f"wcs_frame_{frame}.fits"
+        save_fits(image, path, header)
+        paths.append(path)
+    return paths
