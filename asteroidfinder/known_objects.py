@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import replace
 from pathlib import Path
 from typing import Sequence
 
@@ -107,6 +108,67 @@ def query_known_objects_for_frames(
     for path in paths:
         objects.extend(query_known_objects_in_frame(path, location=location, only_inside=only_inside))
     return objects
+
+
+def query_known_objects_with_motion_cache(
+    paths: Sequence[str | Path],
+    *,
+    location: str = "500",
+    only_inside: bool = True,
+    anchor_index: int | None = None,
+) -> list[KnownObject]:
+    """Query SkyBoT once, then propagate expected positions to all frames.
+
+    SkyBoT calls are slow. For one short image sequence, a known object's
+    SkyBoT RA/Dec rates are good enough to predict per-frame positions without
+    another network request for every exposure.
+    """
+
+    frame_paths = [Path(path) for path in paths]
+    if not frame_paths:
+        return []
+    anchor = min(max(anchor_index if anchor_index is not None else len(frame_paths) // 2, 0), len(frame_paths) - 1)
+    anchor_objects = query_known_objects_in_frame(frame_paths[anchor], location=location, only_inside=only_inside)
+    return predict_known_objects_for_frames(anchor_objects, frame_paths, only_inside=only_inside)
+
+
+def predict_known_objects_for_frames(
+    anchor_objects: Sequence[KnownObject],
+    paths: Sequence[str | Path],
+    *,
+    only_inside: bool = True,
+) -> list[KnownObject]:
+    """Project known-object positions into each frame using WCS and rates."""
+
+    predicted: list[KnownObject] = []
+    for path in paths:
+        image = load_image(path)
+        if image.header is None:
+            continue
+        observation_time = _observation_time(image.header)
+        if observation_time is None:
+            continue
+        wcs = WCS(image.header)
+        if not wcs.has_celestial:
+            continue
+        height, width = image.data.shape
+        for obj in anchor_objects:
+            ra_deg, dec_deg = _propagate_radec(obj, observation_time)
+            x, y = wcs.world_to_pixel_values(ra_deg, dec_deg)
+            if only_inside and not (0 <= x < width and 0 <= y < height):
+                continue
+            predicted.append(
+                replace(
+                    obj,
+                    frame=Path(path),
+                    date_obs=observation_time.isot,
+                    ra_deg=float(ra_deg),
+                    dec_deg=float(dec_deg),
+                    x=float(x),
+                    y=float(y),
+                )
+            )
+    return predicted
 
 
 def write_known_objects_csv(objects: Sequence[KnownObject], path: str | Path) -> Path:
@@ -266,6 +328,22 @@ def _observation_time(header: fits.Header) -> Time | None:
             except Exception:
                 pass
     return None
+
+
+def _propagate_radec(obj: KnownObject, observation_time: Time) -> tuple[float, float]:
+    try:
+        anchor_time = Time(obj.date_obs)
+    except Exception:
+        return obj.ra_deg, obj.dec_deg
+    dt_hours = float((observation_time - anchor_time).to_value(u.hour))
+    dec_deg = obj.dec_deg
+    ra_deg = obj.ra_deg
+    if obj.dec_rate_arcsec_per_hour is not None:
+        dec_deg += obj.dec_rate_arcsec_per_hour * dt_hours / 3600.0
+    if obj.ra_rate_arcsec_per_hour is not None:
+        cos_dec = max(1e-6, abs(np.cos(np.deg2rad(dec_deg))))
+        ra_deg += obj.ra_rate_arcsec_per_hour * dt_hours / 3600.0 / cos_dec
+    return ra_deg % 360.0, dec_deg
 
 
 def _float(value: object) -> float:

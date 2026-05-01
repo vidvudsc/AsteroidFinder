@@ -3,11 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
+import csv
 
 import astroalign as aa
 import numpy as np
 from astropy.wcs import WCS
-from scipy.ndimage import map_coordinates, shift as ndi_shift
+from scipy.ndimage import map_coordinates, median_filter, shift as ndi_shift
 from skimage.registration import phase_cross_correlation
 from skimage.transform import SimilarityTransform, warp
 
@@ -82,7 +83,40 @@ def align_images(
             progress_callback(total, total, "Writing aligned FITS files")
         for frame in result:
             save_fits(frame.data, out_dir / f"{frame.image.path.stem}_aligned.fits", reference_image.header)
+        write_alignment_qa(result, out_dir / "alignment_qa.csv")
     return result
+
+
+def write_alignment_qa(frames: Sequence[AlignedFrame], path: str | Path) -> Path:
+    """Write per-frame alignment quality metrics to CSV."""
+
+    qa_path = Path(path)
+    qa_path.parent.mkdir(parents=True, exist_ok=True)
+    with qa_path.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["frame", "method", "matched_sources", "rms_error_px", "quality"])
+        for index, frame in enumerate(frames):
+            rms = frame.rms_error
+            if index == 0:
+                quality = "reference"
+            elif rms is None or frame.matched_sources == 0:
+                quality = "unknown"
+            elif rms <= 1.0:
+                quality = "good"
+            elif rms <= 2.5:
+                quality = "warning"
+            else:
+                quality = "bad"
+            writer.writerow(
+                [
+                    frame.image.path.name,
+                    frame.method,
+                    frame.matched_sources,
+                    "" if rms is None else f"{rms:.4f}",
+                    quality,
+                ]
+            )
+    return qa_path
 
 
 def crop_to_common_overlap(frames: Sequence[AlignedFrame]) -> list[AlignedFrame]:
@@ -141,8 +175,8 @@ def measure_alignment_error(
 ) -> tuple[float | None, int]:
     """Measure residual star-coordinate error between an aligned image and reference."""
 
-    ref_sources = detect_sources(reference, sigma=sigma, max_sources=max_sources)
-    src_sources = detect_sources(data, sigma=sigma, max_sources=max_sources)
+    ref_sources = detect_sources(_hot_pixel_suppressed(reference), sigma=sigma, max_sources=max_sources)
+    src_sources = detect_sources(_hot_pixel_suppressed(data), sigma=sigma, max_sources=max_sources)
     if not ref_sources or not src_sources:
         return None, 0
     ref_points = np.array([(src.x, src.y) for src in ref_sources], dtype=np.float32)
@@ -171,7 +205,9 @@ def _align_one(
         except ValueError:
             pass
     try:
-        transform, _ = aa.find_transform(data, reference)
+        source_points = _alignment_control_points(data)
+        reference_points = _alignment_control_points(reference)
+        transform, _ = aa.find_transform(source_points, reference_points)
         aligned = warp(
             data,
             inverse_map=transform.inverse,
@@ -285,9 +321,32 @@ def _downsample_for_phase(data: np.ndarray, factor: int) -> np.ndarray:
 
 
 def _normalize_for_phase(data: np.ndarray) -> np.ndarray:
-    image = np.nan_to_num(np.asarray(data, dtype=np.float32), copy=False)
+    image = _hot_pixel_suppressed(data)
     median = float(np.median(image))
     std = float(np.std(image))
     if not np.isfinite(std) or std <= 1e-6:
         return image - median
     return ((image - median) / std).astype(np.float32)
+
+
+def _alignment_control_points(data: np.ndarray, *, max_sources: int = 80) -> np.ndarray:
+    cleaned = _hot_pixel_suppressed(data)
+    sources = detect_sources(cleaned, sigma=5.0, min_area=5, max_sources=max_sources)
+    points = [(source.x, source.y) for source in sources if source.a > 0 and source.b > 0]
+    if len(points) < 3:
+        raise ValueError("Not enough star-like control points for alignment")
+    return np.asarray(points, dtype=np.float32)
+
+
+def _hot_pixel_suppressed(data: np.ndarray, *, sigma: float = 10.0) -> np.ndarray:
+    image = np.nan_to_num(np.asarray(data, dtype=np.float32), copy=True)
+    local = median_filter(image, size=3)
+    residual = image - local
+    mad = np.nanmedian(np.abs(residual - np.nanmedian(residual)))
+    robust_sigma = 1.4826 * mad if mad > 0 else float(np.nanstd(residual))
+    if not np.isfinite(robust_sigma) or robust_sigma <= 0:
+        return image
+    mask = residual > sigma * robust_sigma
+    if np.any(mask):
+        image[mask] = local[mask]
+    return image.astype(np.float32)

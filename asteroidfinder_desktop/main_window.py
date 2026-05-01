@@ -3,14 +3,18 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 import csv
+import shutil
 from time import perf_counter
 import webbrowser
 
+import numpy as np
 from astropy.wcs import WCS
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
 from PySide6.QtCore import QThreadPool, QTimer, Qt
-from PySide6.QtGui import QAction, QColor, QPalette
+from PIL import Image as PILImage
+from PIL import ImageOps
+from PySide6.QtGui import QAction, QColor, QImage, QKeySequence, QPalette, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -29,6 +33,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSlider,
     QSpinBox,
@@ -46,7 +51,7 @@ from asteroidfinder.alignment import align_images
 from asteroidfinder.calibration import calibrate_images_with_persistent_hot_pixels
 from asteroidfinder.diagnostics import plot_track_diagnostics
 from asteroidfinder.io import load_image
-from asteroidfinder.known_objects import KnownObject, query_known_objects_for_frames, write_known_objects_csv
+from asteroidfinder.known_objects import KnownObject, query_known_objects_with_motion_cache, write_known_objects_csv
 from asteroidfinder.mpc import write_detected_track_mpc
 from asteroidfinder.platesolve import solve_image
 from asteroidfinder.report import generate_html_report
@@ -69,9 +74,11 @@ class MainWindow(QMainWindow):
         self._workers: list[FunctionWorker] = []
         self._diagnostic_windows: list[QDialog] = []
         self._report_windows: list[QDialog] = []
+        self._qa_windows: list[QDialog] = []
         self.tracks: list[Track] = []
         self.known_objects: list[KnownObject] = []
         self.track_known_matches: dict[int, str] = {}
+        self.visible_track_indices: set[int] = set()
         self._worker_started_at: dict[str, float] = {}
         self._worker_progress_totals: dict[str, int] = {}
         self._plate_info_cache: dict[Path, tuple[str, str, str, str]] = {}
@@ -82,7 +89,7 @@ class MainWindow(QMainWindow):
 
         self.viewer = FitsViewer()
         self.frame_table = QTableWidget(0, 5)
-        self.track_table = QTableWidget(0, 6)
+        self.track_table = QTableWidget(0, 7)
         self.log = QTextEdit()
         self.log.setReadOnly(True)
         self.progress_bar = QProgressBar()
@@ -300,6 +307,8 @@ class MainWindow(QMainWindow):
 
         analysis_menu = self.menuBar().addMenu("Analysis")
         analysis_menu.addAction("Open Movement Chart", self.open_or_generate_movement_graph)
+        analysis_menu.addAction("Open Hot Pixel QA", self.open_hot_pixel_qa)
+        analysis_menu.addAction("Open Alignment QA", self.open_alignment_qa)
         analysis_menu.addAction("Write PNG Diagnostics", self.write_png_diagnostics)
         analysis_menu.addAction("Export MPC Observations", self.export_mpc)
         analysis_menu.addAction("Open Report", self.open_report_window)
@@ -328,7 +337,7 @@ class MainWindow(QMainWindow):
         plate_layout.addRow("File", self.plate_path)
         layout.addWidget(plate_box)
 
-        self.track_table.setHorizontalHeaderLabels(["ID", "Hits", "Known", "Speed", "PA", "Score"])
+        self.track_table.setHorizontalHeaderLabels(["Show", "ID", "Hits", "Known", "Speed", "PA", "Score"])
         self.track_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.track_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.track_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -349,6 +358,8 @@ class MainWindow(QMainWindow):
 
     def _wire_actions(self) -> None:
         self.blink_slider.valueChanged.connect(lambda _: self._blink_timer.setInterval(self._blink_interval_ms()))
+        self._space_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
+        self._space_shortcut.activated.connect(self.toggle_blink)
 
     def import_images(self) -> None:
         image_suffixes = " ".join(f"*{suffix}" for suffix in sorted(IMAGE_EXTENSIONS))
@@ -439,11 +450,13 @@ class MainWindow(QMainWindow):
         if not paths:
             return
         crop_overlap = bool(self.alignment_output.currentData())
+        aligned_dir = self._output_dir() / "aligned"
+        self._clear_generated_aligned_outputs(aligned_dir)
         self._start_worker(
             "alignment",
             align_images,
             paths,
-            output_dir=self._output_dir() / "aligned",
+            output_dir=aligned_dir,
             crop_overlap=crop_overlap,
             prefer_translation=False,
         )
@@ -480,7 +493,7 @@ class MainWindow(QMainWindow):
         index = self._selected_track_index()
         if index is None:
             index = 0
-        self._open_graph_window(self.tracks, f"Detected Track Movement", start_index=index)
+        self._open_png_diagnostic_window(start_index=index)
 
     def query_known_objects(self) -> None:
         paths = self._require_paths(prefer_solved=True)
@@ -488,7 +501,7 @@ class MainWindow(QMainWindow):
             return
 
         def query() -> list[KnownObject]:
-            objects = query_known_objects_for_frames(paths, location=self.observatory_code.text().strip() or "500")
+            objects = query_known_objects_with_motion_cache(paths, location=self.observatory_code.text().strip() or "500")
             write_known_objects_csv(objects, self._output_dir() / "known_objects.csv")
             return objects
 
@@ -617,6 +630,7 @@ class MainWindow(QMainWindow):
             results = list(result) if isinstance(result, list) else []
             replaced = sum(int(item.hot_pixel_mask.sum()) for item in results if hasattr(item, "hot_pixel_mask"))
             self._log(f"Hot pixels replaced: {replaced} across {len(results)} frame(s)")
+            self._log_hot_pixel_qa()
             calibrated_dir = self._output_dir() / "calibrated"
             calibrated_paths = [
                 calibrated_dir / f"{item.image.path.stem}_calibrated.fits"
@@ -630,17 +644,20 @@ class MainWindow(QMainWindow):
                 self._show_frame(0, keep_view=False)
         elif name == "tracking":
             self.tracks = list(result)  # type: ignore[arg-type]
+            self.visible_track_indices = {0} if self.tracks else set()
             self._match_known_objects_to_tracks()
             self._populate_tracks()
         elif name == "basic workflow":
             tracks = getattr(result, "tracks", [])
             self.tracks = list(tracks)
+            self.visible_track_indices = {0} if self.tracks else set()
             self._match_known_objects_to_tracks()
             self._populate_tracks()
         elif name == "alignment":
             aligned_dir = self._output_dir() / "aligned"
             mode = self.alignment_output.currentText()
             self._log(f"Aligned FITS written to {aligned_dir} ({mode})")
+            self._log_alignment_qa()
             aligned_paths = [aligned_dir / f"{frame.image.path.stem}_aligned.fits" for frame in result] if isinstance(result, list) else []
             existing = [path for path in aligned_paths if path.exists()]
             if existing:
@@ -658,7 +675,7 @@ class MainWindow(QMainWindow):
             self.known_objects = list(result)  # type: ignore[arg-type]
             self._match_known_objects_to_tracks()
             self._populate_tracks()
-            self._log(f"Known objects found: {len(self.known_objects)}")
+            self._log(f"Known objects predicted: {len(self.known_objects)} from one SkyBoT anchor query")
             self._draw_checked_tracks()
         elif name == "PNG diagnostics":
             paths = [Path(path) for path in result] if isinstance(result, list) else []
@@ -695,6 +712,11 @@ class MainWindow(QMainWindow):
         self._updating_track_table = True
         self.track_table.setRowCount(len(self.tracks))
         for row, track in enumerate(self.tracks):
+            show = QCheckBox()
+            show.setChecked(row in self.visible_track_indices)
+            show.setToolTip("Show this detected track on the image")
+            show.toggled.connect(lambda checked, index=row: self._set_track_visible(index, checked))
+            self.track_table.setCellWidget(row, 0, show)
             values = [
                 str(row + 1),
                 str(len(track.detections)),
@@ -704,7 +726,7 @@ class MainWindow(QMainWindow):
                 f"{track.score:.3f}",
             ]
             for column, value in enumerate(values):
-                self.track_table.setItem(row, column, QTableWidgetItem(value))
+                self.track_table.setItem(row, column + 1, QTableWidgetItem(value))
         self._updating_track_table = False
         self._log(f"Tracking found {len(self.tracks)} candidate tracks")
         if self.tracks:
@@ -734,10 +756,20 @@ class MainWindow(QMainWindow):
     def _draw_checked_tracks(self) -> None:
         index = self._selected_track_index()
         self.viewer.clear_overlays()
-        if index is not None:
-            self._draw_track_indices([index], clear_first=False)
+        indices = sorted(self.visible_track_indices)
+        if not indices and index is not None:
+            indices = [index]
+        if indices:
+            self._draw_track_indices(indices, clear_first=False)
         if self.show_known_objects.isChecked():
             self._draw_known_object_overlays()
+
+    def _set_track_visible(self, index: int, checked: bool) -> None:
+        if checked:
+            self.visible_track_indices.add(index)
+        else:
+            self.visible_track_indices.discard(index)
+        self._draw_checked_tracks()
 
     def _draw_track_indices(self, indices: list[int], *, clear_first: bool = True, mode: str | None = None) -> None:
         if clear_first:
@@ -771,25 +803,29 @@ class MainWindow(QMainWindow):
         if index is None or index >= len(self.tracks):
             self._error("No track", "Select a detected track first.")
             return
-        self._open_graph_window(self.tracks, f"Track {index + 1} Movement", start_index=index)
+        self._open_png_diagnostic_window(start_index=index)
 
     def open_all_movement_graphs(self) -> None:
         if not self.tracks:
             self._error("No tracks", "Run tracking before opening movement charts.")
             return
-        self._open_graph_window(self.tracks, "All Movement Charts")
+        self._open_png_diagnostic_window()
 
     def _open_graph_window(self, tracks: list[Track], title: str, *, start_index: int = 0) -> None:
-        frame_size = None
-        if self.session.frames and self.session.frames[0].width and self.session.frames[0].height:
-            frame_size = (self.session.frames[0].width, self.session.frames[0].height)
-        window = DiagnosticWindow(
-            tracks,
-            title,
-            start_index=start_index,
-            known_matches=self.track_known_matches,
-            frame_size=frame_size,
-            show_track_callback=self._show_track_from_chart,
+        self._open_png_diagnostic_window(start_index=start_index)
+
+    def _open_png_diagnostic_window(self, *, start_index: int = 0) -> None:
+        diagnostics_dir = self._output_dir() / "diagnostics"
+        paths = natural_sorted(diagnostics_dir.glob("track_*_diagnostic.png"))
+        if len(paths) < len(self.tracks):
+            paths = plot_track_diagnostics(self.tracks, diagnostics_dir)
+        if not paths:
+            self._error("No diagnostics", "Run tracking before opening movement charts.")
+            return
+        window = ImageDiagnosticWindow(
+            "Movement Diagnostics",
+            [Path(path) for path in paths],
+            start_index=min(max(start_index, 0), len(paths) - 1),
             parent=self,
         )
         window.destroyed.connect(lambda *_: self._forget_diagnostic_window(window))
@@ -817,6 +853,66 @@ class MainWindow(QMainWindow):
     def _forget_report_window(self, window: QDialog) -> None:
         if window in self._report_windows:
             self._report_windows.remove(window)
+
+    def open_hot_pixel_qa(self) -> None:
+        path = self._hot_pixel_qa_dir() / "hot_pixel_summary.csv"
+        if not path.exists():
+            self._error("No hot pixel QA", "Run Clean Hot Pixels first.")
+            return
+        self._open_qa_window("Hot Pixel QA", path, self._hot_pixel_qa_dir())
+
+    def open_alignment_qa(self) -> None:
+        path = self._alignment_qa_path()
+        if not path.exists():
+            self._error("No alignment QA", "Run Align Stars first.")
+            return
+        self._open_qa_window("Alignment QA", path, path.parent)
+
+    def _open_qa_window(self, title: str, csv_path: Path, folder: Path) -> None:
+        window = QaWindow(title, csv_path, folder, parent=self)
+        window.destroyed.connect(lambda *_: self._forget_qa_window(window))
+        self._qa_windows.append(window)
+        window.show()
+
+    def _forget_qa_window(self, window: QDialog) -> None:
+        if window in self._qa_windows:
+            self._qa_windows.remove(window)
+
+    def _hot_pixel_qa_dir(self) -> Path:
+        return self._output_dir() / "calibrated" / "hot_pixel_qa"
+
+    def _alignment_qa_path(self) -> Path:
+        return self._output_dir() / "aligned" / "alignment_qa.csv"
+
+    def _log_hot_pixel_qa(self) -> None:
+        rows = _read_csv_file(self._hot_pixel_qa_dir() / "hot_pixel_summary.csv")
+        if not rows:
+            return
+        persistent_total = rows[0].get("persistent_mask_total", "0")
+        transient_total = rows[0].get("transient_union_total", "0")
+        worst = max(rows, key=lambda row: int(row.get("transient_hits_in_frame") or 0))
+        self._log(
+            "Hot pixel QA: "
+            f"persistent={persistent_total}, transient union={transient_total}, "
+            f"worst transient frame={worst.get('frame', '')} ({worst.get('transient_hits_in_frame', '0')})"
+        )
+        self._log(f"Hot pixel masks written to {self._hot_pixel_qa_dir()}")
+
+    def _log_alignment_qa(self) -> None:
+        rows = _read_csv_file(self._alignment_qa_path())
+        measured = [row for row in rows if row.get("rms_error_px")]
+        if not measured:
+            return
+        worst = max(measured, key=lambda row: float(row.get("rms_error_px") or 0.0))
+        good = sum(1 for row in measured if row.get("quality") == "good")
+        warning = sum(1 for row in measured if row.get("quality") == "warning")
+        bad = sum(1 for row in measured if row.get("quality") == "bad")
+        self._log(
+            "Alignment QA: "
+            f"good={good}, warning={warning}, bad={bad}, "
+            f"worst={worst.get('frame', '')} rms={worst.get('rms_error_px', '')} px "
+            f"matches={worst.get('matched_sources', '')}"
+        )
 
     def _match_known_objects_to_tracks(self, *, radius_px: float = 20.0) -> None:
         self.track_known_matches = {}
@@ -884,7 +980,10 @@ class MainWindow(QMainWindow):
         if prefer_aligned:
             aligned = natural_sorted((self._output_dir() / "aligned").glob("*_aligned.fits"))
             if aligned:
-                return self._validate_paths(aligned, require_same_shape=require_same_shape)
+                valid_aligned = self._validate_paths(aligned, require_same_shape=require_same_shape, show_error=False)
+                if valid_aligned:
+                    return valid_aligned
+                self._log("Ignoring stale aligned outputs with mixed dimensions; using current frame list instead.")
         if prefer_solved:
             solved = natural_sorted((self._output_dir() / "solved").glob("*.new"))
             if solved:
@@ -895,12 +994,14 @@ class MainWindow(QMainWindow):
             return []
         return self._validate_paths(paths, require_same_shape=require_same_shape)
 
-    def _validate_paths(self, paths: list[Path], *, require_same_shape: bool) -> list[Path]:
+    def _validate_paths(self, paths: list[Path], *, require_same_shape: bool, show_error: bool = True) -> list[Path]:
         if not require_same_shape:
             return paths
         groups = self._shape_groups(paths)
         if len(groups) <= 1:
             return paths
+        if not show_error:
+            return []
         lines = [f"{shape[1]} x {shape[0]}: {len(shape_paths)} image(s)" for shape, shape_paths in groups.items()]
         self._error(
             "Image sizes do not match",
@@ -909,6 +1010,14 @@ class MainWindow(QMainWindow):
             + "\n\nImport one matching image set, or plate solve/calibrate matching frames separately.",
         )
         return []
+
+    def _clear_generated_aligned_outputs(self, aligned_dir: Path) -> None:
+        aligned_dir.mkdir(parents=True, exist_ok=True)
+        for path in aligned_dir.glob("*"):
+            if path.is_file() and (path.name.endswith("_aligned.fits") or path.name == "alignment_qa.csv"):
+                path.unlink()
+            elif path.is_dir() and path.name == "diagnostics":
+                shutil.rmtree(path)
 
     def _shape_groups(self, paths: list[Path]) -> dict[tuple[int, int], list[Path]]:
         groups: dict[tuple[int, int], list[Path]] = {}
@@ -1317,7 +1426,6 @@ class TrackChartWidget(QWidget):
         self._points: list[tuple[float, float, float, float]] = []
         self.canvas.mpl_connect("button_press_event", self._pick_detection)
         self.canvas.mpl_connect("motion_notify_event", self._hover_detection)
-        self.canvas.mpl_connect("scroll_event", self._wheel_zoom)
 
     def set_track(
         self,
@@ -1335,8 +1443,7 @@ class TrackChartWidget(QWidget):
         self._draw()
 
     def set_zoom(self, zoom: int) -> None:
-        self.zoom = max(25, min(500, zoom))
-        self._draw()
+        self.zoom = 100
 
     def _draw(self) -> None:
         self.figure.clear()
@@ -1387,7 +1494,6 @@ class TrackChartWidget(QWidget):
 
         self._plot_series(ax_x, frames, xs, fit_x, "X position", "#34d399")
         self._plot_series(ax_y, frames, ys, fit_y, "Y position", "#a78bfa")
-        self._apply_zoom()
         self.figure.suptitle(self._title(), color="#e8f3ff", fontsize=12)
         self.canvas.draw_idle()
 
@@ -1413,31 +1519,6 @@ class TrackChartWidget(QWidget):
         axis.grid(True, color="#26364a", linewidth=0.7, alpha=0.8)
         for spine in axis.spines.values():
             spine.set_color("#3b4c62")
-
-    def _apply_zoom(self) -> None:
-        if not self.axes or not self._points:
-            return
-        if self.zoom <= 100:
-            return
-        selected = self._selected_point()
-        path_axis, x_axis, y_axis = self.axes
-        for axis, center_x, center_y in [
-            (path_axis, selected[1], selected[2]),
-            (x_axis, selected[0], selected[1]),
-            (y_axis, selected[0], selected[2]),
-        ]:
-            x_low, x_high = axis.get_xlim()
-            y_low, y_high = axis.get_ylim()
-            axis.set_xlim(*self._zoomed_limits(x_low, x_high, center_x))
-            axis.set_ylim(*self._zoomed_limits(y_low, y_high, center_y))
-
-    def _zoomed_limits(self, low: float, high: float, center: float) -> tuple[float, float]:
-        span = abs(high - low)
-        if span <= 1e-9:
-            return low, high
-        visible = span * 100.0 / self.zoom
-        half = visible / 2.0
-        return center - half, center + half
 
     def _selected_point(self) -> tuple[float, float, float, float]:
         index = min(max(self.selected_offset, 0), len(self._points) - 1)
@@ -1469,15 +1550,6 @@ class TrackChartWidget(QWidget):
         distance_sq, index = min(candidates)
         if distance_sq <= 14**2 and index != self.selected_offset and self.on_selected_offset is not None:
             self.on_selected_offset(index)
-
-    def _wheel_zoom(self, event: Any) -> None:
-        if event.step == 0:
-            return
-        factor = 1.22 if event.step > 0 else 1 / 1.22
-        self.zoom = max(25, min(500, int(self.zoom * factor)))
-        if self.on_zoom_changed is not None:
-            self.on_zoom_changed(self.zoom)
-        self._draw()
 
     def _title(self) -> str:
         if self.track is None:
@@ -1528,15 +1600,11 @@ class DiagnosticWindow(QDialog):
         copy_button.clicked.connect(self._copy_summary)
         self.caption = QLabel()
         self.caption.setObjectName("MutedText")
-        reset_zoom = QPushButton("Reset Zoom")
-        reset_zoom.clicked.connect(lambda: self._set_zoom(100))
         controls.addWidget(previous)
         controls.addWidget(next_button)
         controls.addWidget(show_button)
         controls.addWidget(copy_button)
         controls.addWidget(self.caption, 1)
-        controls.addWidget(reset_zoom)
-        controls.addWidget(QLabel("Mouse wheel zoom"))
         layout.addLayout(controls)
 
         scrub = QHBoxLayout()
@@ -1702,6 +1770,76 @@ class DiagnosticWindow(QDialog):
         self._render_chart()
 
 
+class ImageDiagnosticWindow(QDialog):
+    def __init__(self, title: str, image_paths: list[Path], *, start_index: int = 0, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.image_paths = image_paths
+        self.index = min(max(start_index, 0), max(len(image_paths) - 1, 0))
+        self._pixmap = QPixmap()
+        self.setWindowTitle(title)
+        self.resize(1180, 820)
+        layout = QVBoxLayout(self)
+        controls = QHBoxLayout()
+        previous = _icon_button("◀", "Previous diagnostic")
+        previous.clicked.connect(lambda: self._step(-1))
+        next_button = _icon_button("▶", "Next diagnostic")
+        next_button.clicked.connect(lambda: self._step(1))
+        open_file = QPushButton("Open PNG")
+        open_file.clicked.connect(self._open_current)
+        self.caption = QLabel()
+        self.caption.setObjectName("MutedText")
+        controls.addWidget(previous)
+        controls.addWidget(next_button)
+        controls.addWidget(open_file)
+        controls.addWidget(self.caption, 1)
+        layout.addLayout(controls)
+
+        self.image_label = QLabel()
+        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image_label.setStyleSheet("background: #0b111a;")
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(False)
+        self.scroll.setWidget(self.image_label)
+        layout.addWidget(self.scroll, 1)
+        self._load_current()
+
+    def _step(self, delta: int) -> None:
+        if not self.image_paths:
+            return
+        self.index = (self.index + delta) % len(self.image_paths)
+        self._load_current()
+
+    def _open_current(self) -> None:
+        if self.image_paths:
+            webbrowser.open(self.image_paths[self.index].resolve().as_uri())
+
+    def _load_current(self) -> None:
+        if not self.image_paths:
+            return
+        path = self.image_paths[self.index]
+        self._pixmap = QPixmap(str(path))
+        self.caption.setText(f"{self.index + 1} / {len(self.image_paths)}   {path.name}")
+        self._update_preview()
+
+    def _update_preview(self) -> None:
+        if self._pixmap.isNull():
+            self.image_label.setText("No preview")
+            return
+        viewport = self.scroll.viewport().size()
+        scaled = self._pixmap.scaled(
+            max(64, viewport.width() - 16),
+            max(64, viewport.height() - 16),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.image_label.setPixmap(scaled)
+        self.image_label.resize(scaled.size())
+
+    def resizeEvent(self, event: Any) -> None:
+        super().resizeEvent(event)
+        self._update_preview()
+
+
 class ReportWindow(QDialog):
     def __init__(self, path: Path, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1765,6 +1903,120 @@ class ReportWindow(QDialog):
                 files.addItem(str(path.relative_to(out_dir)))
         layout.addWidget(files, 1)
         return widget
+
+
+class QaWindow(QDialog):
+    def __init__(self, title: str, csv_path: Path, folder: Path, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.csv_path = csv_path
+        self.folder = folder
+        self.image_paths: list[Path] = []
+        self.image_list = QListWidget()
+        self.image_label = QLabel()
+        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image_label.setStyleSheet("background: #ffffff; color: #111111;")
+        self._current_pixmap = QPixmap()
+        self.setWindowTitle(title)
+        self.resize(980, 640)
+        layout = QVBoxLayout(self)
+        controls = QHBoxLayout()
+        open_folder = QPushButton("Open Folder")
+        open_folder.clicked.connect(lambda: webbrowser.open(self.folder.resolve().as_uri()))
+        refresh = QPushButton("Refresh")
+        refresh.clicked.connect(self._load)
+        self.invert_mask = QCheckBox("Invert")
+        self.invert_mask.toggled.connect(self._select_current_image)
+        self.color_mask = QCheckBox("Color")
+        self.color_mask.setChecked(True)
+        self.color_mask.toggled.connect(self._select_current_image)
+        controls.addWidget(QLabel(str(csv_path)))
+        controls.addStretch(1)
+        controls.addWidget(self.color_mask)
+        controls.addWidget(self.invert_mask)
+        controls.addWidget(refresh)
+        controls.addWidget(open_folder)
+        layout.addLayout(controls)
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs, 1)
+        self._load()
+
+    def _load(self) -> None:
+        self.tabs.clear()
+        self.image_paths = sorted(self.folder.glob("*.png"))
+        if self.image_paths:
+            self.tabs.addTab(self._image_tab(), "Masks")
+        rows = _read_csv_file(self.csv_path)
+        if rows:
+            self.tabs.addTab(_table_widget(rows), "Summary")
+        files = QListWidget()
+        for path in sorted(self.folder.rglob("*")):
+            if path.is_file():
+                files.addItem(str(path.relative_to(self.folder)))
+        files.itemDoubleClicked.connect(lambda item: webbrowser.open((self.folder / item.text()).resolve().as_uri()))
+        self.tabs.addTab(files, "Files")
+
+    def _image_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QHBoxLayout(widget)
+        self.image_list = QListWidget()
+        self.image_list.setMaximumWidth(300)
+        for path in self.image_paths:
+            self.image_list.addItem(path.name)
+        self.image_list.currentRowChanged.connect(self._select_image)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(False)
+        scroll.setBackgroundRole(QPalette.ColorRole.Base)
+        scroll.setWidget(self.image_label)
+        self.mask_scroll = scroll
+        layout.addWidget(self.image_list)
+        layout.addWidget(scroll, 1)
+        self.image_list.setCurrentRow(0)
+        return widget
+
+    def _select_image(self, row: int) -> None:
+        if row < 0 or row >= len(self.image_paths):
+            return
+        self._current_pixmap = _mask_preview_pixmap(self.image_paths[row], invert=self.invert_mask.isChecked(), color=self.color_mask.isChecked())
+        self._update_image_preview()
+
+    def _select_current_image(self) -> None:
+        self._select_image(self.image_list.currentRow())
+
+    def _update_image_preview(self) -> None:
+        if self._current_pixmap.isNull():
+            self.image_label.setText("No preview")
+            return
+        viewport = self.mask_scroll.viewport().size() if hasattr(self, "mask_scroll") else self.size()
+        scale = max(1, min((viewport.width() - 16) // max(1, self._current_pixmap.width()), (viewport.height() - 16) // max(1, self._current_pixmap.height())))
+        scaled = self._current_pixmap.scaled(
+            self._current_pixmap.width() * scale,
+            self._current_pixmap.height() * scale,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.FastTransformation,
+        )
+        self.image_label.setPixmap(scaled)
+        self.image_label.resize(scaled.size())
+
+    def resizeEvent(self, event: Any) -> None:
+        super().resizeEvent(event)
+        self._update_image_preview()
+
+
+def _mask_preview_pixmap(path: Path, *, invert: bool, color: bool) -> QPixmap:
+    image = PILImage.open(path).convert("RGB")
+    if color:
+        array = np.asarray(image, dtype=np.uint8)
+        gray = array.mean(axis=2)
+        colored = np.full(array.shape, 255, dtype=np.uint8)
+        colored[gray < 64] = (255, 24, 72)
+        colored[(gray >= 64) & (gray < 210)] = (36, 160, 255)
+        image = PILImage.fromarray(colored, mode="RGB")
+    if invert:
+        image = ImageOps.invert(image)
+    raw = image.tobytes("raw", "RGB")
+    qimage = QImage(raw, image.width, image.height, image.width * 3, QImage.Format.Format_RGB888).copy()
+    return QPixmap.fromImage(qimage)
 
 
 def _read_csv_file(path: Path) -> list[dict[str, str]]:

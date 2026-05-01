@@ -3,9 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
+import csv
 
 import numpy as np
 from astropy.io import fits
+from PIL import Image
 from scipy.ndimage import maximum_filter, median_filter
 
 from .io import AstroImage, load_image, save_fits
@@ -16,6 +18,26 @@ class CalibrationResult:
     image: AstroImage
     data: np.ndarray
     hot_pixel_mask: np.ndarray
+
+
+@dataclass(frozen=True)
+class HotPixelFrameDiagnostic:
+    path: Path
+    candidate_count: int
+    persistent_count: int
+    transient_count: int
+    mask_path: Path | None = None
+
+
+@dataclass(frozen=True)
+class HotPixelDiagnostic:
+    shape: tuple[int, int]
+    min_frames: int
+    persistent_count: int
+    transient_count: int
+    persistent_mask_path: Path | None
+    transient_mask_path: Path | None
+    frame_diagnostics: list[HotPixelFrameDiagnostic]
 
 
 def make_master_frame(paths: Sequence[str | Path], *, method: str = "median") -> np.ndarray:
@@ -114,13 +136,18 @@ def calibrate_images_with_persistent_hot_pixels(
     done = 0
     grouped_paths = _group_paths_by_shape(all_paths)
     results = []
+    if output_dir is not None:
+        summary_path = Path(output_dir) / "hot_pixel_qa" / "hot_pixel_summary.csv"
+        if summary_path.exists():
+            summary_path.unlink()
     for shape_paths in grouped_paths.values():
-        mask = build_persistent_hot_pixel_mask(
+        mask, diagnostic = _build_persistent_hot_pixel_mask_with_diagnostic(
             shape_paths,
             sigma=hot_sigma,
             neighbor_sigma=neighbor_sigma,
             min_center_neighbor_ratio=min_center_neighbor_ratio,
             min_frames=min_frames,
+            diagnostic_dir=None if output_dir is None else Path(output_dir) / "hot_pixel_qa",
             progress_callback=(
                 None
                 if progress_callback is None
@@ -155,12 +182,39 @@ def build_persistent_hot_pixel_mask(
 ) -> np.ndarray:
     """Build a fixed sensor-coordinate hot-pixel mask from a sequence."""
 
+    mask, _diagnostic = _build_persistent_hot_pixel_mask_with_diagnostic(
+        paths,
+        sigma=sigma,
+        neighbor_sigma=neighbor_sigma,
+        min_center_neighbor_ratio=min_center_neighbor_ratio,
+        min_frames=min_frames,
+        filter_size=filter_size,
+        diagnostic_dir=None,
+        progress_callback=progress_callback,
+    )
+    return mask
+
+
+def _build_persistent_hot_pixel_mask_with_diagnostic(
+    paths: Sequence[str | Path],
+    *,
+    sigma: float = 25.0,
+    neighbor_sigma: float = 6.0,
+    min_center_neighbor_ratio: float = 2.0,
+    min_frames: int | None = None,
+    filter_size: int = 3,
+    diagnostic_dir: str | Path | None = None,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+) -> tuple[np.ndarray, HotPixelDiagnostic | None]:
+    """Build a fixed hot-pixel mask and optional QA artifacts."""
+
     if not paths:
         raise ValueError("No images provided")
     detections: list[np.ndarray] = []
+    loaded_paths = [Path(path) for path in paths]
     shape: tuple[int, int] | None = None
     total = len(paths)
-    for index, path in enumerate(paths, start=1):
+    for index, path in enumerate(loaded_paths, start=1):
         image = load_image(path).data
         if shape is None:
             shape = image.shape
@@ -182,7 +236,112 @@ def build_persistent_hot_pixel_mask(
             progress_callback(index, total, f"Scanning {Path(path).name}")
     counts = np.sum(np.stack(detections), axis=0)
     required = min_frames if min_frames is not None else max(2, int(np.ceil(len(detections) * 0.8)))
-    return counts >= required
+    persistent = counts >= required
+    diagnostic = None
+    if diagnostic_dir is not None and shape is not None:
+        diagnostic = _write_hot_pixel_diagnostics(
+            loaded_paths,
+            detections,
+            persistent,
+            required,
+            Path(diagnostic_dir),
+        )
+    return persistent, diagnostic
+
+
+def _write_hot_pixel_diagnostics(
+    paths: Sequence[Path],
+    detections: Sequence[np.ndarray],
+    persistent: np.ndarray,
+    min_frames: int,
+    out_dir: Path,
+) -> HotPixelDiagnostic:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    persistent_path = out_dir / f"persistent_mask_{persistent.shape[1]}x{persistent.shape[0]}.png"
+    _write_mask_png(persistent, persistent_path)
+
+    transient_union = np.logical_or.reduce([mask & ~persistent for mask in detections])
+    transient_path = out_dir / f"transient_union_{persistent.shape[1]}x{persistent.shape[0]}.png"
+    _write_mask_png(transient_union, transient_path)
+
+    frame_rows: list[HotPixelFrameDiagnostic] = []
+    for path, mask in zip(paths, detections):
+        frame_persistent = mask & persistent
+        frame_transient = mask & ~persistent
+        mask_path = out_dir / f"{path.stem}_hot_pixel_classified.png"
+        _write_classified_hot_pixel_png(frame_persistent, frame_transient, mask_path)
+        frame_rows.append(
+            HotPixelFrameDiagnostic(
+                path=path,
+                candidate_count=int(mask.sum()),
+                persistent_count=int(frame_persistent.sum()),
+                transient_count=int(frame_transient.sum()),
+                mask_path=mask_path,
+            )
+        )
+
+    diagnostic = HotPixelDiagnostic(
+        shape=tuple(int(value) for value in persistent.shape),
+        min_frames=int(min_frames),
+        persistent_count=int(persistent.sum()),
+        transient_count=int(transient_union.sum()),
+        persistent_mask_path=persistent_path,
+        transient_mask_path=transient_path,
+        frame_diagnostics=frame_rows,
+    )
+    _write_hot_pixel_summary(out_dir, diagnostic)
+    return diagnostic
+
+
+def _write_hot_pixel_summary(out_dir: Path, diagnostic: HotPixelDiagnostic) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = out_dir / "hot_pixel_summary.csv"
+    write_header = not summary_path.exists()
+    with summary_path.open("a", newline="") as handle:
+        writer = csv.writer(handle)
+        if write_header:
+            writer.writerow(
+                [
+                    "frame",
+                    "width",
+                    "height",
+                    "min_frames_for_persistent",
+                    "candidate_count",
+                    "persistent_hits_in_frame",
+                    "transient_hits_in_frame",
+                    "persistent_mask_total",
+                    "transient_union_total",
+                    "mask_png",
+                ]
+            )
+        height, width = diagnostic.shape
+        for row in diagnostic.frame_diagnostics:
+            writer.writerow(
+                [
+                    row.path.name,
+                    width,
+                    height,
+                    diagnostic.min_frames,
+                    row.candidate_count,
+                    row.persistent_count,
+                    row.transient_count,
+                    diagnostic.persistent_count,
+                    diagnostic.transient_count,
+                    "" if row.mask_path is None else row.mask_path.name,
+                ]
+            )
+
+
+def _write_mask_png(mask: np.ndarray, path: Path) -> None:
+    data = np.where(np.asarray(mask, dtype=bool), 0, 255).astype(np.uint8)
+    Image.fromarray(data, mode="L").save(path)
+
+
+def _write_classified_hot_pixel_png(persistent: np.ndarray, transient: np.ndarray, path: Path) -> None:
+    rgb = np.full((*persistent.shape, 3), 255, dtype=np.uint8)
+    rgb[np.asarray(transient, dtype=bool)] = (150, 150, 150)
+    rgb[np.asarray(persistent, dtype=bool)] = (0, 0, 0)
+    Image.fromarray(rgb, mode="RGB").save(path)
 
 
 def detect_isolated_hot_pixels(
@@ -276,14 +435,22 @@ def _robust_sigma(data: np.ndarray) -> float:
 
 def _masked_3x3_median(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
     padded = np.pad(image, 1, mode="edge")
+    padded_mask = np.pad(mask, 1, mode="edge")
     ys, xs = np.nonzero(mask)
     neighborhoods = np.empty((len(ys), 9), dtype=np.float32)
+    valid = np.empty((len(ys), 9), dtype=bool)
     index = 0
     for dy in range(3):
         for dx in range(3):
             neighborhoods[:, index] = padded[ys + dy, xs + dx]
+            valid[:, index] = ~padded_mask[ys + dy, xs + dx]
             index += 1
-    return np.median(neighborhoods, axis=1).astype(np.float32)
+    valid[:, 4] = False
+    neighborhoods[~valid] = np.nan
+    replacements = np.nanmedian(neighborhoods, axis=1)
+    fallback = median_filter(image, size=3)[ys, xs]
+    replacements = np.where(np.isfinite(replacements), replacements, fallback)
+    return replacements.astype(np.float32)
 
 
 def _optional_frame(frame: np.ndarray | str | Path | None) -> np.ndarray | None:

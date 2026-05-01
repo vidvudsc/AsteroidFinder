@@ -11,9 +11,11 @@ from asteroidfinder.diagnostics import plot_track_diagnostics
 from asteroidfinder.doctor import recommend_index_series, run_doctor
 from asteroidfinder.detection import detect_sources
 from asteroidfinder.io import load_image, save_fits
+from asteroidfinder.known_objects import KnownObject, predict_known_objects_for_frames
 from asteroidfinder.mpc import write_detected_track_mpc
 from asteroidfinder.photometry import aperture_photometry
 from asteroidfinder.tracking import track_moving_objects
+from asteroidfinder_desktop.session import natural_sorted
 
 
 def test_load_fits_color_cube_as_luminance(tmp_path: Path) -> None:
@@ -129,6 +131,45 @@ def test_persistent_hot_pixel_mask_does_not_flag_moving_star(tmp_path: Path) -> 
     assert sum(int(result.hot_pixel_mask.sum()) for result in results) == 4
 
 
+def test_persistent_hot_pixel_calibration_writes_qa_masks(tmp_path: Path) -> None:
+    paths = []
+    for frame in range(3):
+        image = np.full((20, 20), 100, dtype=np.float32)
+        image[5, 6] = 8000
+        image[10, 8 + frame] = 7000
+        path = tmp_path / f"qa_{frame}.fits"
+        save_fits(image, path)
+        paths.append(path)
+
+    out_dir = tmp_path / "calibrated"
+    calibrate_images_with_persistent_hot_pixels(
+        paths,
+        output_dir=out_dir,
+        hot_sigma=8,
+        neighbor_sigma=4,
+        min_center_neighbor_ratio=2,
+        min_frames=2,
+    )
+
+    qa_dir = out_dir / "hot_pixel_qa"
+    summary = qa_dir / "hot_pixel_summary.csv"
+    assert summary.exists()
+    text = summary.read_text()
+    assert "persistent_mask_total" in text
+    assert "transient_hits_in_frame" in text
+    assert (qa_dir / "persistent_mask_20x20.png").exists()
+    assert (qa_dir / "transient_union_20x20.png").exists()
+    assert (qa_dir / "qa_0_hot_pixel_classified.png").exists()
+    from PIL import Image
+
+    persistent_preview = Image.open(qa_dir / "persistent_mask_20x20.png").convert("L")
+    classified_preview = Image.open(qa_dir / "qa_0_hot_pixel_classified.png").convert("RGB")
+    assert persistent_preview.getpixel((0, 0)) == 255
+    assert persistent_preview.getpixel((6, 5)) == 0
+    assert classified_preview.getpixel((6, 5)) == (0, 0, 0)
+    assert classified_preview.getpixel((8, 10)) == (150, 150, 150)
+
+
 def test_persistent_hot_pixel_calibration_handles_mixed_shapes(tmp_path: Path) -> None:
     paths = []
     for index, shape in enumerate([(20, 20), (20, 20), (12, 16)]):
@@ -141,6 +182,22 @@ def test_persistent_hot_pixel_calibration_handles_mixed_shapes(tmp_path: Path) -
     results = calibrate_images_with_persistent_hot_pixels(paths, hot_sigma=8, neighbor_sigma=4, min_center_neighbor_ratio=2)
 
     assert [result.data.shape for result in results] == [(20, 20), (20, 20), (12, 16)]
+
+
+def test_hot_pixel_mask_replacement_ignores_masked_neighbors() -> None:
+    from asteroidfinder.calibration import apply_hot_pixel_mask
+
+    image = np.full((7, 7), 100, dtype=np.float32)
+    image[3, 3] = 9000
+    image[3, 4] = 8000
+    mask = np.zeros(image.shape, dtype=bool)
+    mask[3, 3] = True
+    mask[3, 4] = True
+
+    cleaned = apply_hot_pixel_mask(image, mask)
+
+    assert cleaned[3, 3] == 100
+    assert cleaned[3, 4] == 100
 
 
 def test_aperture_photometry_measures_positive_flux() -> None:
@@ -197,6 +254,49 @@ def test_align_images_uses_wcs_reprojection_when_available(tmp_path: Path) -> No
     assert aligned[1].method == "wcs-reproject"
     assert aligned[1].footprint is not None
     assert aligned[1].data.shape == aligned[0].data.shape
+
+
+def test_align_images_writes_alignment_qa(tmp_path: Path) -> None:
+    paths = _synthetic_wcs_sequence(tmp_path)
+
+    align_images(paths, output_dir=tmp_path / "aligned", prefer_translation=False)
+
+    qa_path = tmp_path / "aligned" / "alignment_qa.csv"
+    assert qa_path.exists()
+    text = qa_path.read_text()
+    assert "rms_error_px" in text
+    assert "wcs-reproject" in text
+
+
+def test_align_images_ignores_isolated_hot_pixels_in_star_matching(tmp_path: Path) -> None:
+    paths = []
+    yy, xx = np.indices((160, 160))
+    stars = [(30, 30), (120, 35), (45, 120), (125, 125), (80, 70), (25, 95)]
+    shift_x, shift_y = 4, -3
+    hot_pixels = [(8, 8), (150, 20), (16, 140), (141, 142), (80, 150), (100, 12)]
+    for frame in range(2):
+        image = np.zeros((160, 160), dtype=np.float32) + 20
+        for x, y in stars:
+            sx = x + (shift_x if frame else 0)
+            sy = y + (shift_y if frame else 0)
+            image += 800 * np.exp(-((xx - sx) ** 2 + (yy - sy) ** 2) / 5)
+        for index, (x, y) in enumerate(hot_pixels):
+            image[y, x] = 15000 + index * 100
+        path = tmp_path / f"frame_{frame + 1}.fits"
+        save_fits(image, path)
+        paths.append(path)
+
+    aligned = align_images(paths, prefer_translation=False)
+
+    assert aligned[1].method == "astroalign"
+    assert aligned[1].rms_error is not None
+    assert aligned[1].rms_error < 1.0
+
+
+def test_natural_sorted_keeps_numeric_frame_order() -> None:
+    paths = [Path("frame_10.fits"), Path("frame_2.fits"), Path("frame_1.fits")]
+
+    assert [path.name for path in natural_sorted(paths)] == ["frame_1.fits", "frame_2.fits", "frame_10.fits"]
 
 
 def test_detected_track_mpc_export_uses_measured_track(tmp_path: Path) -> None:
@@ -275,6 +375,31 @@ def test_known_object_time_fallback_accepts_obsjd() -> None:
     header["OBSJD"] = 2460675.5
 
     assert _observation_time(header).isot.startswith("2024-")
+
+
+def test_known_object_prediction_uses_rates_without_requery(tmp_path: Path) -> None:
+    paths = _synthetic_wcs_sequence(tmp_path)
+    anchor = KnownObject(
+        frame=paths[0],
+        date_obs="2026-01-01T00:00:00.000",
+        number="1",
+        name="TestAst",
+        object_type="asteroid",
+        ra_deg=100.0,
+        dec_deg=20.0,
+        x=60.0,
+        y=60.0,
+        v_mag=18.0,
+        center_distance_arcsec=None,
+        ra_rate_arcsec_per_hour=36.0,
+        dec_rate_arcsec_per_hour=0.0,
+    )
+
+    predicted = predict_known_objects_for_frames([anchor], paths)
+
+    assert len(predicted) == 3
+    assert [obj.frame for obj in predicted] == paths
+    assert predicted[2].x != predicted[0].x
 
 
 def _synthetic_wcs_sequence(tmp_path: Path) -> list[Path]:
