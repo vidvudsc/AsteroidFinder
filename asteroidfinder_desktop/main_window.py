@@ -52,6 +52,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("AsteroidFinder")
         self.session = SessionState()
         self.thread_pool = QThreadPool.globalInstance()
+        self.thread_pool.setMaxThreadCount(1)
+        self.thread_pool.setStackSize(32 * 1024 * 1024)
         self._workers: list[FunctionWorker] = []
         self.tracks: list[Track] = []
         self._current_frame_index = 0
