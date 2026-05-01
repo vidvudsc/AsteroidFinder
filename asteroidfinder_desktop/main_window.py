@@ -73,6 +73,7 @@ class MainWindow(QMainWindow):
         self.known_objects: list[KnownObject] = []
         self.track_known_matches: dict[int, str] = {}
         self._worker_started_at: dict[str, float] = {}
+        self._worker_progress_totals: dict[str, int] = {}
         self._plate_info_cache: dict[Path, tuple[str, str, str, str]] = {}
         self._updating_track_table = False
         self._current_frame_index = 0
@@ -546,6 +547,9 @@ class MainWindow(QMainWindow):
         return int(slow_ms - fraction * (slow_ms - fast_ms))
 
     def _start_worker(self, name: str, fn: Any, *args: Any, **kwargs: Any) -> None:
+        total = _initial_progress_total(name, args)
+        if total is not None:
+            self._worker_progress_totals[name] = total
         worker = FunctionWorker(name, fn, *args, **kwargs)
         worker.signals.started.connect(self._worker_started)
         worker.signals.progress.connect(self._worker_progress)
@@ -559,8 +563,14 @@ class MainWindow(QMainWindow):
     def _worker_started(self, name: str) -> None:
         self._worker_started_at[name] = perf_counter()
         self._log(f"Started {name}")
-        self.progress_label.setText(f"Running {name}")
-        self.progress_bar.setRange(0, 0)
+        total = self._worker_progress_totals.get(name)
+        if total is None:
+            self.progress_label.setText(f"Running {name}")
+            self.progress_bar.setRange(0, 0)
+        else:
+            self.progress_label.setText(f"{name} 0/{total}")
+            self.progress_bar.setRange(0, total)
+            self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
 
     def _worker_progress(self, name: str, done: int, total: int, text: str) -> None:
@@ -631,6 +641,7 @@ class MainWindow(QMainWindow):
             self._workers.remove(worker)
 
     def _worker_elapsed_text(self, name: str) -> str:
+        self._worker_progress_totals.pop(name, None)
         started = self._worker_started_at.pop(name, None)
         if started is None:
             return ""
@@ -1141,6 +1152,24 @@ def _known_objects_matching_frame(objects: list[KnownObject], frame_path: Path, 
         fallback_frame = known_frames[frame_index]
         return [obj for obj in objects if obj.frame == fallback_frame]
     return []
+
+
+def _initial_progress_total(name: str, args: tuple[Any, ...]) -> int | None:
+    if not args:
+        return None
+    try:
+        count = len(args[0])
+    except TypeError:
+        return None
+    if count <= 0:
+        return None
+    if name == "plate solve":
+        return count
+    if name == "calibration":
+        return count * 3
+    if name == "alignment":
+        return count * 2 + 1
+    return None
 
 
 def _pixel_scale_arcsec(wcs: WCS) -> float | None:

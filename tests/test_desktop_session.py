@@ -6,7 +6,7 @@ import numpy as np
 
 from asteroidfinder.io import save_fits
 from asteroidfinder.known_objects import KnownObject
-from asteroidfinder_desktop.main_window import _frame_match_key, _known_objects_matching_frame
+from asteroidfinder_desktop.main_window import _frame_match_key, _initial_progress_total, _known_objects_matching_frame
 from asteroidfinder_desktop.session import FrameInfo, SessionState, discover_fits_files, filter_image_files, load_session, save_session
 from asteroidfinder_desktop.viewer import _display_luminance
 
@@ -85,6 +85,15 @@ def test_known_object_overlay_falls_back_to_frame_order() -> None:
     matches = _known_objects_matching_frame([first, second], Path("raw/not-the-same-name.fit"), 1)
 
     assert matches == [second]
+
+
+def test_initial_progress_totals_for_slow_desktop_steps() -> None:
+    paths = [Path("a.fit"), Path("b.fit"), Path("c.fit")]
+
+    assert _initial_progress_total("plate solve", (paths,)) == 3
+    assert _initial_progress_total("calibration", (paths,)) == 9
+    assert _initial_progress_total("alignment", (paths,)) == 7
+    assert _initial_progress_total("tracking", (paths,)) is None
 
 
 def _known_object(frame: Path) -> KnownObject:
