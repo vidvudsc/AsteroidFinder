@@ -70,6 +70,24 @@ python demo/run_demo.py --use-raw --index-dir ~/astrometry-indexes/4200
 - `demo2/` runs the clean ZTF Photographica workflow and produces a structured
   report with speed comparison, SkyBoT match tables, and track diagnostics.
 
+## Desktop Preview
+
+Install the optional desktop UI dependencies:
+
+```bash
+python3 -m pip install -e ".[desktop]"
+```
+
+Then launch the early dark-themed desktop app:
+
+```bash
+asteroidfinder-desktop
+```
+
+The first GUI version can open a FITS folder, preview and blink frames, invert
+the view, run calibration, plate solving, alignment, tracking, and export
+measured detected-track MPC files through the existing library pipeline.
+
 ## Python API
 
 ```python
