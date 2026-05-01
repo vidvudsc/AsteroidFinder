@@ -786,8 +786,8 @@ class MainWindow(QMainWindow):
     def _known_objects_for_current_frame(self) -> list[KnownObject]:
         if not self.known_objects or not self.session.frames:
             return []
-        frame_name = Path(self.session.frames[self._current_frame_index].path).name
-        return [obj for obj in self.known_objects if Path(obj.frame).name == frame_name]
+        frame = self.session.frames[self._current_frame_index]
+        return _known_objects_matching_frame(self.known_objects, Path(frame.path), self._current_frame_index)
 
     def _selected_track_index(self) -> int | None:
         rows = self.track_table.selectionModel().selectedRows()
@@ -1086,6 +1086,44 @@ def _short_error(details: str) -> str:
         if "Error:" in line or "Exception:" in line or line.startswith("ValueError"):
             return line
     return lines[-1]
+
+
+def _frame_match_key(path: str | Path) -> str:
+    stem = Path(path).stem
+    changed = True
+    while changed:
+        changed = False
+        for suffix in ("-solveinput", "_solveinput", "_aligned", "_calibrated"):
+            if stem.endswith(suffix):
+                stem = stem[: -len(suffix)]
+                changed = True
+    return stem
+
+
+def _unique_known_frames(objects: list[KnownObject]) -> list[Path]:
+    frames: list[Path] = []
+    seen: set[Path] = set()
+    for obj in objects:
+        if obj.frame not in seen:
+            seen.add(obj.frame)
+            frames.append(obj.frame)
+    return frames
+
+
+def _known_objects_matching_frame(objects: list[KnownObject], frame_path: Path, frame_index: int) -> list[KnownObject]:
+    current_key = _frame_match_key(frame_path)
+    matches = [obj for obj in objects if _frame_match_key(obj.frame) == current_key]
+    if matches:
+        return matches
+
+    # Solved files may be generated beside the imported images without
+    # replacing the current frame list. In that case, preserve the query
+    # order and map frame N in the viewer to frame N in known-object data.
+    known_frames = _unique_known_frames(objects)
+    if frame_index < len(known_frames):
+        fallback_frame = known_frames[frame_index]
+        return [obj for obj in objects if obj.frame == fallback_frame]
+    return []
 
 
 def _pixel_scale_arcsec(wcs: WCS) -> float | None:

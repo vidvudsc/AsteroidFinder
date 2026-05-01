@@ -5,6 +5,8 @@ from pathlib import Path
 import numpy as np
 
 from asteroidfinder.io import save_fits
+from asteroidfinder.known_objects import KnownObject
+from asteroidfinder_desktop.main_window import _frame_match_key, _known_objects_matching_frame
 from asteroidfinder_desktop.session import FrameInfo, SessionState, discover_fits_files, filter_image_files, load_session, save_session
 from asteroidfinder_desktop.viewer import _display_luminance
 
@@ -67,3 +69,37 @@ def test_mono_preview_keeps_original_pixels() -> None:
     preview = _display_luminance(data, {"BAYERPAT": "INVALID"})
 
     assert np.array_equal(preview, data)
+
+
+def test_known_object_overlay_matches_solved_variant_name() -> None:
+    obj = _known_object(Path("frame-001-solveinput.new"))
+
+    assert _frame_match_key(Path("frame-001.fits")) == _frame_match_key(obj.frame)
+    assert _known_objects_matching_frame([obj], Path("frame-001.fits"), 0) == [obj]
+
+
+def test_known_object_overlay_falls_back_to_frame_order() -> None:
+    first = _known_object(Path("solved/a-solveinput.new"))
+    second = _known_object(Path("solved/b-solveinput.new"))
+
+    matches = _known_objects_matching_frame([first, second], Path("raw/not-the-same-name.fit"), 1)
+
+    assert matches == [second]
+
+
+def _known_object(frame: Path) -> KnownObject:
+    return KnownObject(
+        frame=frame,
+        date_obs="2026-01-01T00:00:00",
+        number="",
+        name="Test",
+        object_type="MB",
+        ra_deg=1.0,
+        dec_deg=2.0,
+        x=10.0,
+        y=20.0,
+        v_mag=None,
+        center_distance_arcsec=None,
+        ra_rate_arcsec_per_hour=None,
+        dec_rate_arcsec_per_hour=None,
+    )
