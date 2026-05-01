@@ -89,9 +89,9 @@ class FitsViewer(QGraphicsView):
             self._overlay_items.append(dot)
 
     def wheelEvent(self, event: QWheelEvent) -> None:
-        factor = 1.2 if event.angleDelta().y() > 0 else 1 / 1.2
+        factor = 1.08 if event.angleDelta().y() > 0 else 1 / 1.08
         next_zoom = self._zoom * factor
-        if next_zoom < 0.05 or next_zoom > 80:
+        if next_zoom < 0.35 or next_zoom > 35:
             return
         self._zoom = next_zoom
         self.scale(factor, factor)

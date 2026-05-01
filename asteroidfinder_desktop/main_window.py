@@ -12,12 +12,14 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSlider,
     QSpinBox,
@@ -60,6 +62,16 @@ class MainWindow(QMainWindow):
         self.track_table = QTableWidget(0, 7)
         self.log = QTextEdit()
         self.log.setReadOnly(True)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setTextVisible(True)
+        self.progress_label = QLabel("Idle")
+        self.progress_label.setObjectName("MutedText")
+        self.plate_status = QLabel("No frame selected")
+        self.plate_center = QLabel("")
+        self.plate_scale = QLabel("")
+        self.plate_path = QLabel("")
+        self.plate_path.setWordWrap(True)
 
         self.input_edit = QLineEdit()
         self.input_edit.setReadOnly(True)
@@ -176,6 +188,10 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.blink_slider)
         layout.addLayout(controls)
         layout.addWidget(self.viewer, 1)
+        progress_row = QHBoxLayout()
+        progress_row.addWidget(self.progress_label)
+        progress_row.addWidget(self.progress_bar, 1)
+        layout.addLayout(progress_row)
         return panel
 
     def _analysis_panel(self) -> QWidget:
@@ -190,6 +206,14 @@ class MainWindow(QMainWindow):
         self.frame_table.itemSelectionChanged.connect(self._selected_frame_changed)
         layout.addWidget(QLabel("Frames"))
         layout.addWidget(self.frame_table, 2)
+
+        plate_box = QGroupBox("Plate Solve")
+        plate_layout = QFormLayout(plate_box)
+        plate_layout.addRow("Status", self.plate_status)
+        plate_layout.addRow("Center", self.plate_center)
+        plate_layout.addRow("Pixel scale", self.plate_scale)
+        plate_layout.addRow("File", self.plate_path)
+        layout.addWidget(plate_box)
 
         self.track_table.setHorizontalHeaderLabels(["ID", "Hits", "Vx", "Vy", "Sky speed", "PA", "Score"])
         self.track_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
@@ -340,7 +364,7 @@ class MainWindow(QMainWindow):
 
     def _start_worker(self, name: str, fn: Any, *args: Any, **kwargs: Any) -> None:
         worker = FunctionWorker(name, fn, *args, **kwargs)
-        worker.signals.started.connect(lambda task: self._log(f"Started {task}"))
+        worker.signals.started.connect(self._worker_started)
         worker.signals.failed.connect(self._worker_failed)
         worker.signals.finished.connect(self._worker_finished)
         worker.signals.finished.connect(lambda *_: self._forget_worker(worker))
@@ -348,12 +372,26 @@ class MainWindow(QMainWindow):
         self._workers.append(worker)
         self.thread_pool.start(worker)
 
+    def _worker_started(self, name: str) -> None:
+        self._log(f"Started {name}")
+        self.progress_label.setText(f"Running {name}")
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setVisible(True)
+
     def _worker_failed(self, name: str, details: str) -> None:
         self._log(f"{name} failed")
+        self.progress_label.setText(f"{name} failed")
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
         self._error(f"{name} failed", details)
 
     def _worker_finished(self, name: str, result: object) -> None:
         self._log(f"Finished {name}")
+        self.progress_label.setText(f"Finished {name}")
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(1)
+        self.progress_bar.setVisible(True)
         if name == "tracking":
             self.tracks = list(result)  # type: ignore[arg-type]
             self._populate_tracks()
@@ -366,6 +404,11 @@ class MainWindow(QMainWindow):
             self._log(f"Aligned FITS written to {aligned_dir}")
         elif name == "plate solve":
             self._log(f"Solved FITS written to {self._output_dir() / 'solved'}")
+            solved_paths = [Path(path) for path in result] if isinstance(result, list) else []
+            if solved_paths:
+                self.session.frames = [self._frame_info(path) for path in solved_paths]
+                self._populate_frames()
+                self._show_frame(0, keep_view=False)
 
     def _forget_worker(self, worker: FunctionWorker) -> None:
         if worker in self._workers:
@@ -426,6 +469,7 @@ class MainWindow(QMainWindow):
         frame = self.session.frames[self._current_frame_index]
         self.viewer.load_path(frame.path, keep_view=keep_view)
         self.frame_table.selectRow(self._current_frame_index)
+        self._update_plate_info(Path(frame.path))
 
     def _step_frame(self, delta: int) -> None:
         if self.session.frames:
@@ -498,6 +542,33 @@ class MainWindow(QMainWindow):
     def _error(self, title: str, detail: str) -> None:
         QMessageBox.critical(self, title, detail)
 
+    def _update_plate_info(self, path: Path) -> None:
+        try:
+            image = load_image(path)
+            header = image.header
+            if header is None:
+                self._set_unsolved_plate_info(path, "No FITS header")
+                return
+            wcs = WCS(header)
+            if not wcs.has_celestial:
+                self._set_unsolved_plate_info(path, "No WCS")
+                return
+            height, width = image.data.shape
+            ra, dec = wcs.pixel_to_world_values(width / 2, height / 2)
+            scale = _pixel_scale_arcsec(wcs)
+            self.plate_status.setText("Solved WCS")
+            self.plate_center.setText(f"RA {float(ra):.6f}, Dec {float(dec):.6f}")
+            self.plate_scale.setText("unknown" if scale is None else f"{scale:.3f} arcsec/px")
+            self.plate_path.setText(path.name)
+        except Exception as exc:
+            self._set_unsolved_plate_info(path, f"Read failed: {exc}")
+
+    def _set_unsolved_plate_info(self, path: Path, status: str) -> None:
+        self.plate_status.setText(status)
+        self.plate_center.setText("")
+        self.plate_scale.setText("")
+        self.plate_path.setText(path.name)
+
 
 def apply_dark_theme(app: QApplication) -> None:
     palette = QPalette()
@@ -567,6 +638,31 @@ def apply_dark_theme(app: QApplication) -> None:
             margin: -5px 0;
             border-radius: 7px;
         }
+        QGroupBox {
+            border: 1px solid #26364a;
+            border-radius: 4px;
+            margin-top: 8px;
+            padding: 8px;
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            left: 8px;
+            padding: 0 4px;
+            color: #9fc7ea;
+        }
+        QProgressBar {
+            background: #070b11;
+            border: 1px solid #26364a;
+            border-radius: 3px;
+            height: 14px;
+            text-align: center;
+        }
+        QProgressBar::chunk {
+            background: #2a8cdc;
+        }
+        #MutedText {
+            color: #9fb2c5;
+        }
         """
     )
 
@@ -590,3 +686,13 @@ def _size_text(frame: FrameInfo) -> str:
     if frame.width is None or frame.height is None:
         return ""
     return f"{frame.width} x {frame.height}"
+
+
+def _pixel_scale_arcsec(wcs: WCS) -> float | None:
+    try:
+        from astropy.wcs.utils import proj_plane_pixel_scales
+
+        scales = proj_plane_pixel_scales(wcs.celestial) * 3600.0
+        return float(sum(abs(value) for value in scales) / len(scales))
+    except Exception:
+        return None
