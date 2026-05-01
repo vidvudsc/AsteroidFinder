@@ -78,7 +78,7 @@ class MainWindow(QMainWindow):
 
         self.viewer = FitsViewer()
         self.frame_table = QTableWidget(0, 5)
-        self.track_table = QTableWidget(0, 9)
+        self.track_table = QTableWidget(0, 7)
         self.log = QTextEdit()
         self.log.setReadOnly(True)
         self.progress_bar = QProgressBar()
@@ -279,10 +279,11 @@ class MainWindow(QMainWindow):
         plate_layout.addRow("File", self.plate_path)
         layout.addWidget(plate_box)
 
-        self.track_table.setHorizontalHeaderLabels(["Show", "ID", "Known", "Hits", "Vx", "Vy", "Sky speed", "PA", "Score"])
+        self.track_table.setHorizontalHeaderLabels(["ID", "Hits", "Vx", "Vy", "Sky speed", "PA", "Score"])
         self.track_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.track_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.track_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.track_table.itemSelectionChanged.connect(self._selected_track_changed)
-        self.track_table.itemChanged.connect(self._track_item_changed)
         layout.addWidget(QLabel("Detected Tracks"))
         layout.addWidget(self.show_full_track)
         layout.addWidget(self.track_table, 1)
@@ -564,13 +565,8 @@ class MainWindow(QMainWindow):
         self._updating_track_table = True
         self.track_table.setRowCount(len(self.tracks))
         for row, track in enumerate(self.tracks):
-            show_item = QTableWidgetItem()
-            show_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
-            show_item.setCheckState(Qt.CheckState.Checked if row == 0 else Qt.CheckState.Unchecked)
-            self.track_table.setItem(row, 0, show_item)
             values = [
                 str(row + 1),
-                self.track_known_matches.get(row, ""),
                 str(len(track.detections)),
                 f"{track.velocity_x:.3f}",
                 f"{track.velocity_y:.3f}",
@@ -579,17 +575,12 @@ class MainWindow(QMainWindow):
                 f"{track.score:.3f}",
             ]
             for column, value in enumerate(values):
-                self.track_table.setItem(row, column + 1, QTableWidgetItem(value))
+                self.track_table.setItem(row, column, QTableWidgetItem(value))
         self._updating_track_table = False
         self._log(f"Tracking found {len(self.tracks)} candidate tracks")
         if self.tracks:
             self.track_table.selectRow(0)
-            self._draw_checked_tracks()
-
-    def _track_item_changed(self, item: QTableWidgetItem) -> None:
-        if self._updating_track_table or item.column() != 0:
-            return
-        self._draw_checked_tracks()
+            self._draw_selected_track()
 
     def _selected_frame_changed(self) -> None:
         rows = self.frame_table.selectionModel().selectedRows()
@@ -603,8 +594,7 @@ class MainWindow(QMainWindow):
         index = rows[0].row()
         if index >= len(self.tracks):
             return
-        if not self._checked_track_indices():
-            self._draw_selected_track()
+        self._draw_selected_track()
 
     def _draw_selected_track(self) -> None:
         index = self._selected_track_index()
@@ -613,10 +603,10 @@ class MainWindow(QMainWindow):
         self._draw_track_indices([index])
 
     def _draw_checked_tracks(self) -> None:
-        indices = self._checked_track_indices()
+        index = self._selected_track_index()
         self.viewer.clear_overlays()
-        if indices:
-            self._draw_track_indices(indices, clear_first=False)
+        if index is not None:
+            self._draw_track_indices([index], clear_first=False)
 
     def _draw_track_indices(self, indices: list[int], *, clear_first: bool = True, mode: str | None = None) -> None:
         if clear_first:
@@ -638,14 +628,6 @@ class MainWindow(QMainWindow):
                 current_index=current_detection_index,
                 color=colors[index % len(colors)],
             )
-
-    def _checked_track_indices(self) -> list[int]:
-        indices = []
-        for row in range(self.track_table.rowCount()):
-            item = self.track_table.item(row, 0)
-            if item is not None and item.checkState() == Qt.CheckState.Checked:
-                indices.append(row)
-        return indices
 
     def open_selected_movement_graph(self) -> None:
         index = self._selected_track_index()

@@ -1,6 +1,8 @@
 # AsteroidFinder
 
-AsteroidFinder is a Python library for command-line astronomical image work:
+AsteroidFinder is a Python library and desktop app for real astronomical image
+work: plate solving, FITS inspection, alignment, blinking, hot-pixel cleanup,
+moving-object tracking, known-object lookup, and MPC-style export.
 
 - Load FITS, FIT, JPEG, PNG, TIFF images into calibrated numeric arrays.
 - Read solved WCS from FITS headers when present.
@@ -10,6 +12,7 @@ AsteroidFinder is a Python library for command-line astronomical image work:
 - Stack aligned images.
 - Track moving-object candidates across an aligned image sequence.
 - Query known solar-system objects with SkyBoT when WCS is available.
+- Export measured detected-track observations to MPC-style text and CSV.
 - Generate per-track diagnostic plots with pixel motion, RA/Dec trends, speed,
   position angle, and fit residuals.
 
@@ -70,7 +73,7 @@ python demo/run_demo.py --use-raw --index-dir ~/astrometry-indexes/4200
 - `demo2/` runs the clean ZTF Photographica workflow and produces a structured
   report with speed comparison, SkyBoT match tables, and track diagnostics.
 
-## Desktop Preview
+## Desktop App
 
 Install the optional desktop UI dependencies:
 
@@ -84,10 +87,25 @@ Then launch the early dark-themed desktop app:
 asteroidfinder-desktop
 ```
 
-The first GUI version can import selected FITS images, preview and blink
-frames, invert the view, run calibration, plate solving, alignment, tracking,
-and export measured detected-track MPC files through the existing library
-pipeline.
+The desktop app can import selected FITS images, preview and blink frames,
+invert the view, run calibration, plate solving, alignment, tracking,
+known-object lookup, one-click reports, PNG diagnostics, and measured-track MPC
+exports through the same library pipeline.
+
+![AsteroidFinder desktop main view](docs/main.png)
+
+![AsteroidFinder desktop inverted view](docs/main-inverted.png)
+
+Current desktop inspection features:
+
+- cached FITS preview and blink playback
+- WCS status and frame metadata table
+- selected-track overlay with a single toggle for current-frame circle or full
+  motion path
+- embedded Matplotlib movement chart with pan/zoom toolbar
+- per-detection measurement table with pixel, SNR, flux, residual, and WCS
+  coordinates when available
+- report window for output CSVs and generated HTML report
 
 ## Python API
 
