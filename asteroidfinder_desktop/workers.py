@@ -18,6 +18,7 @@ class WorkerSignals(QObject):
     message = Signal(object)
     finished = Signal(str, object)
     failed = Signal(str, str)
+    cancelled = Signal(str)
 
 
 class FunctionWorker(QRunnable):
@@ -28,13 +29,23 @@ class FunctionWorker(QRunnable):
         self.args = args
         self.kwargs = kwargs
         self.signals = WorkerSignals()
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
 
     @Slot()
     def run(self) -> None:
+        if self._cancelled:
+            self.signals.cancelled.emit(self.name)
+            return
         self.signals.started.emit(self.name)
         try:
             result = self.fn(*self.args, **self.kwargs)
         except Exception:
             self.signals.failed.emit(self.name, traceback.format_exc())
+            return
+        if self._cancelled:
+            self.signals.cancelled.emit(self.name)
             return
         self.signals.finished.emit(self.name, result)

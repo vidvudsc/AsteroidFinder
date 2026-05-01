@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 import csv
+import math
 import webbrowser
 
 from astropy.wcs import WCS
@@ -44,7 +45,14 @@ from asteroidfinder.alignment import align_images
 from asteroidfinder.calibration import calibrate_images_with_persistent_hot_pixels
 from asteroidfinder.diagnostics import plot_track_diagnostics
 from asteroidfinder.io import load_image
-from asteroidfinder.known_objects import KnownObject, query_known_objects_for_frames, write_known_objects_csv
+from asteroidfinder.known_objects import (
+    KnownObject,
+    KnownObjectPhotometry,
+    forced_photometry_for_known_objects,
+    query_known_objects_for_frames,
+    write_known_object_photometry_csv,
+    write_known_objects_csv,
+)
 from asteroidfinder.mpc import write_detected_track_mpc
 from asteroidfinder.platesolve import solve_image
 from asteroidfinder.report import generate_html_report
@@ -69,7 +77,11 @@ class MainWindow(QMainWindow):
         self._report_windows: list[QDialog] = []
         self.tracks: list[Track] = []
         self.known_objects: list[KnownObject] = []
+        self.target_photometry: list[KnownObjectPhotometry] = []
         self.track_known_matches: dict[int, str] = {}
+        self.target_rows: list[dict[str, str]] = []
+        self._worker_rows: dict[str, int] = {}
+        self._last_failed_step: str | None = None
         self._plate_info_cache: dict[Path, tuple[str, str, str, str]] = {}
         self._updating_track_table = False
         self._current_frame_index = 0
@@ -79,6 +91,9 @@ class MainWindow(QMainWindow):
         self.viewer = FitsViewer()
         self.frame_table = QTableWidget(0, 5)
         self.track_table = QTableWidget(0, 7)
+        self.known_table = QTableWidget(0, 8)
+        self.target_table = QTableWidget(0, 8)
+        self.queue_table = QTableWidget(0, 3)
         self.log = QTextEdit()
         self.log.setReadOnly(True)
         self.progress_bar = QProgressBar()
@@ -115,7 +130,12 @@ class MainWindow(QMainWindow):
         self.alignment_output.setToolTip("Crop removes black no-data borders after alignment. Keep reference canvas is better for debugging.")
         self.show_full_track = QCheckBox("Show full track")
         self.show_full_track.setToolTip("Off shows one circle on the current frame. On shows every detection and the motion line.")
-        self.show_full_track.toggled.connect(lambda _: self._draw_checked_tracks())
+        self.show_full_track.toggled.connect(lambda _: self._draw_current_overlays())
+        self.show_predictions = QCheckBox("Show predicted positions")
+        self.show_predictions.setToolTip("Overlay SkyBoT/MPC predicted positions for the selected frame.")
+        self.show_predictions.toggled.connect(lambda _: self._draw_current_overlays())
+        self.target_edit = QLineEdit()
+        self.target_edit.setPlaceholderText("Target name/designation")
         self.invert_check = QCheckBox("Invert")
         self.blink_slider = QSlider(Qt.Orientation.Horizontal)
         self.blink_slider.setRange(1, 20)
@@ -181,6 +201,7 @@ class MainWindow(QMainWindow):
             ("Align Frames", self.run_alignment),
             ("Track Moving Objects", self.run_tracking),
             ("Query Known Objects", self.query_known_objects),
+            ("Track Target", self.run_target_tracking),
             ("Open Report", self.open_report_window),
             ("Full Basic Run", self.run_full_workflow),
             ("Export MPC", self.export_mpc),
@@ -248,6 +269,7 @@ class MainWindow(QMainWindow):
         run_menu.addAction("Align Frames", self.run_alignment)
         run_menu.addAction("Track Moving Objects", self.run_tracking)
         run_menu.addAction("Query Known Objects", self.query_known_objects)
+        run_menu.addAction("Track Target", self.run_target_tracking)
         run_menu.addAction("Open Movement Chart", self.open_or_generate_movement_graph)
         run_menu.addAction("Write PNG Diagnostics", self.write_png_diagnostics)
         run_menu.addAction("Open Report", self.open_report_window)
@@ -292,6 +314,47 @@ class MainWindow(QMainWindow):
         graph_button.clicked.connect(self.open_or_generate_movement_graph)
         graph_row.addWidget(graph_button)
         layout.addLayout(graph_row)
+
+        target_box = QGroupBox("Target Tracking")
+        target_layout = QVBoxLayout(target_box)
+        target_controls = QHBoxLayout()
+        target_controls.addWidget(self.target_edit, 1)
+        target_button = QPushButton("Track")
+        target_button.clicked.connect(self.run_target_tracking)
+        export_target = QPushButton("Export CSV")
+        export_target.clicked.connect(self.export_target_csv)
+        target_controls.addWidget(target_button)
+        target_controls.addWidget(export_target)
+        target_layout.addLayout(target_controls)
+        target_layout.addWidget(self.show_predictions)
+        self.target_table.setHorizontalHeaderLabels(["Object", "Frame", "Pred X", "Pred Y", "SNR", "Flux", "Match", "Offset"])
+        self.target_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.target_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.target_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        target_layout.addWidget(self.target_table)
+        layout.addWidget(target_box, 1)
+
+        self.known_table.setHorizontalHeaderLabels(["Object", "Frame", "V", "Exp speed", "Exp PA", "Match", "Meas speed", "Offset"])
+        self.known_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.known_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.known_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        layout.addWidget(QLabel("Known Object Matches"))
+        layout.addWidget(self.known_table, 1)
+
+        self.queue_table.setHorizontalHeaderLabels(["Step", "Status", "Detail"])
+        self.queue_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.queue_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        queue_row = QHBoxLayout()
+        retry_button = QPushButton("Retry Failed")
+        retry_button.clicked.connect(self.retry_failed_step)
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(self.cancel_pending_work)
+        queue_row.addWidget(QLabel("Processing Queue"))
+        queue_row.addStretch(1)
+        queue_row.addWidget(cancel_button)
+        queue_row.addWidget(retry_button)
+        layout.addLayout(queue_row)
+        layout.addWidget(self.queue_table, 1)
 
         layout.addWidget(QLabel("Log"))
         layout.addWidget(self.log, 1)
@@ -413,13 +476,58 @@ class MainWindow(QMainWindow):
         paths = self._require_paths(prefer_solved=True)
         if not paths:
             return
+        out_dir = self._output_dir()
+        location = self.observatory_code.text().strip() or "500"
 
         def query() -> list[KnownObject]:
-            objects = query_known_objects_for_frames(paths, location=self.observatory_code.text().strip() or "500")
-            write_known_objects_csv(objects, self._output_dir() / "known_objects.csv")
+            objects = query_known_objects_for_frames(paths, location=location)
+            write_known_objects_csv(objects, out_dir / "known_objects.csv")
             return objects
 
         self._start_worker("known objects", query)
+
+    def run_target_tracking(self) -> None:
+        target = self.target_edit.text().strip()
+        if not target:
+            self._error("No target", "Enter an asteroid name, number, or designation first.")
+            return
+        paths = self._require_paths(prefer_solved=True)
+        if not paths:
+            return
+        out_dir = self._output_dir()
+        location = self.observatory_code.text().strip() or "500"
+
+        def track_target() -> dict[str, object]:
+            objects = query_known_objects_for_frames(paths, location=location)
+            target_objects = [obj for obj in objects if self._object_matches_target(obj, target)]
+            write_known_objects_csv(objects, out_dir / "known_objects.csv")
+            write_known_objects_csv(target_objects, out_dir / "target_objects.csv")
+            photometry = forced_photometry_for_known_objects(target_objects)
+            write_known_object_photometry_csv(photometry, out_dir / "target_forced_photometry.csv")
+            return {"objects": objects, "target_objects": target_objects, "photometry": photometry}
+
+        self._start_worker("target tracking", track_target)
+
+    def export_target_csv(self) -> None:
+        if not self.target_rows:
+            self._error("No target rows", "Run target tracking before exporting the target table.")
+            return
+        output = self._output_dir() / "target_tracking.csv"
+        with output.open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(self.target_rows[0]))
+            writer.writeheader()
+            writer.writerows(self.target_rows)
+        self._log(f"Target tracking CSV written: {output}")
+
+    def cancel_pending_work(self) -> None:
+        if not self._workers:
+            self._log("No queued work to cancel")
+            return
+        for worker in list(self._workers):
+            worker.cancel()
+            self._set_queue_step(worker.name, "Cancelling", "Active external commands may finish before stopping")
+        self.thread_pool.clear()
+        self._log("Cancellation requested")
 
     def open_report_window(self) -> None:
         self._start_worker("report", generate_html_report, self._output_dir())
@@ -487,27 +595,43 @@ class MainWindow(QMainWindow):
         worker.signals.started.connect(self._worker_started)
         worker.signals.failed.connect(self._worker_failed)
         worker.signals.finished.connect(self._worker_finished)
+        worker.signals.cancelled.connect(self._worker_cancelled)
         worker.signals.finished.connect(lambda *_: self._forget_worker(worker))
         worker.signals.failed.connect(lambda *_: self._forget_worker(worker))
+        worker.signals.cancelled.connect(lambda *_: self._forget_worker(worker))
         self._workers.append(worker)
         self.thread_pool.start(worker)
 
     def _worker_started(self, name: str) -> None:
         self._log(f"Started {name}")
+        self._set_queue_step(name, "Running", "")
         self.progress_label.setText(f"Running {name}")
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setVisible(True)
 
     def _worker_failed(self, name: str, details: str) -> None:
         self._log(f"{name} failed")
+        self._last_failed_step = name
+        self._set_queue_step(name, "Failed", _short_error(details))
         self.progress_label.setText(f"{name} failed")
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
         self._error(f"{name} failed", _short_error(details))
 
+    def _worker_cancelled(self, name: str) -> None:
+        self._log(f"{name} cancelled")
+        self._set_queue_step(name, "Cancelled", "Result ignored")
+        self.progress_label.setText(f"{name} cancelled")
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+
     def _worker_finished(self, name: str, result: object) -> None:
         self._log(f"Finished {name}")
+        self._set_queue_step(name, "Done", "")
+        if self._last_failed_step == name:
+            self._last_failed_step = None
         self.progress_label.setText(f"Finished {name}")
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(1)
@@ -516,11 +640,15 @@ class MainWindow(QMainWindow):
             self.tracks = list(result)  # type: ignore[arg-type]
             self._match_known_objects_to_tracks()
             self._populate_tracks()
+            self._populate_known_objects()
+            self._populate_target_tracking()
         elif name == "basic workflow":
             tracks = getattr(result, "tracks", [])
             self.tracks = list(tracks)
             self._match_known_objects_to_tracks()
             self._populate_tracks()
+            self._populate_known_objects()
+            self._populate_target_tracking()
         elif name == "alignment":
             aligned_dir = self._output_dir() / "aligned"
             mode = self.alignment_output.currentText()
@@ -536,13 +664,67 @@ class MainWindow(QMainWindow):
             self.known_objects = list(result)  # type: ignore[arg-type]
             self._match_known_objects_to_tracks()
             self._populate_tracks()
+            self._populate_known_objects()
+            self._populate_target_tracking()
+            self._draw_current_overlays()
             self._log(f"Known objects found: {len(self.known_objects)}")
+        elif name == "target tracking":
+            payload = result if isinstance(result, dict) else {}
+            self.known_objects = list(payload.get("objects", []))  # type: ignore[arg-type]
+            target_objects = list(payload.get("target_objects", []))  # type: ignore[arg-type]
+            self.target_photometry = list(payload.get("photometry", []))  # type: ignore[arg-type]
+            self._match_known_objects_to_tracks()
+            self._populate_tracks()
+            self._populate_known_objects()
+            self._populate_target_tracking(target_objects, self.target_photometry)
+            self._draw_current_overlays()
+            self._log(f"Target predictions: {len(target_objects)}, forced photometry rows: {len(self.target_photometry)}")
         elif name == "PNG diagnostics":
             paths = [Path(path) for path in result] if isinstance(result, list) else []
             self._log(f"PNG diagnostics written: {len(paths)} file(s) in {self._output_dir() / 'diagnostics'}")
         elif name == "report":
             path = Path(result) if isinstance(result, (str, Path)) else self._output_dir() / "report.html"
             self._open_report_dialog(path)
+
+    def retry_failed_step(self) -> None:
+        if not self._last_failed_step:
+            self._error("No failed step", "There is no failed processing step to retry.")
+            return
+        handlers = {
+            "calibration": self.run_calibration,
+            "plate solve": self.run_plate_solve,
+            "alignment": self.run_alignment,
+            "tracking": self.run_tracking,
+            "known objects": self.query_known_objects,
+            "target tracking": self.run_target_tracking,
+            "PNG diagnostics": self.write_png_diagnostics,
+            "report": self.open_report_window,
+            "basic workflow": self.run_full_workflow,
+            "MPC export": self.export_mpc,
+        }
+        handler = handlers.get(self._last_failed_step)
+        if handler is None:
+            self._error("Retry unavailable", f"No retry handler is registered for {self._last_failed_step}.")
+            return
+        handler()
+
+    def _set_queue_step(self, name: str, status: str, detail: str) -> None:
+        row = self._worker_rows.get(name)
+        if row is None:
+            row = self.queue_table.rowCount()
+            self.queue_table.insertRow(row)
+            self._worker_rows[name] = row
+        for column, value in enumerate([name, status, detail]):
+            item = QTableWidgetItem(value)
+            if status == "Failed":
+                item.setForeground(QColor("#fb7185"))
+            elif status == "Running":
+                item.setForeground(QColor("#fbbf24"))
+            elif status == "Done":
+                item.setForeground(QColor("#34d399"))
+            elif status in {"Cancelling", "Cancelled"}:
+                item.setForeground(QColor("#a78bfa"))
+            self.queue_table.setItem(row, column, item)
 
     def _forget_worker(self, worker: FunctionWorker) -> None:
         if worker in self._workers:
@@ -582,6 +764,72 @@ class MainWindow(QMainWindow):
             self.track_table.selectRow(0)
             self._draw_selected_track()
 
+    def _populate_known_objects(self) -> None:
+        self.known_table.setRowCount(len(self.known_objects))
+        for row, obj in enumerate(self.known_objects):
+            match = self._nearest_track_detection(obj)
+            expected_speed, expected_pa = self._expected_motion(obj)
+            offset_px = match[2] if match is not None else None
+            offset_arcsec = self._offset_arcsec(obj, offset_px)
+            values = [
+                self._object_label(obj),
+                self._frame_label_for_object(obj),
+                "" if obj.v_mag is None else f"{obj.v_mag:.2f}",
+                "" if expected_speed is None else f"{expected_speed:.2f}",
+                "" if expected_pa is None else f"{expected_pa:.1f}",
+                "" if match is None else f"AF{match[0] + 1:04d}",
+                "" if match is None or self.tracks[match[0]].angular_rate_arcsec_per_frame is None else f"{self.tracks[match[0]].angular_rate_arcsec_per_frame:.3f}",
+                self._offset_text(offset_px, offset_arcsec),
+            ]
+            for column, value in enumerate(values):
+                self.known_table.setItem(row, column, QTableWidgetItem(value))
+
+    def _populate_target_tracking(
+        self,
+        objects: list[KnownObject] | None = None,
+        photometry: list[KnownObjectPhotometry] | None = None,
+    ) -> None:
+        target = self.target_edit.text().strip()
+        source_objects = self.known_objects if objects is None else objects
+        if target and objects is None:
+            source_objects = [obj for obj in source_objects if self._object_matches_target(obj, target)]
+        photometry = self.target_photometry if photometry is None else photometry
+        phot_by_key = {self._object_key(item.known_object): item for item in photometry}
+        self.target_rows = []
+        self.target_table.setRowCount(len(source_objects))
+        for row, obj in enumerate(source_objects):
+            match = self._nearest_track_detection(obj)
+            offset_px = match[2] if match is not None else None
+            offset_arcsec = self._offset_arcsec(obj, offset_px)
+            phot = phot_by_key.get(self._object_key(obj))
+            csv_row = {
+                "object": self._object_label(obj),
+                "frame": self._frame_label_for_object(obj),
+                "date_obs": obj.date_obs,
+                "pred_x": f"{obj.x:.3f}",
+                "pred_y": f"{obj.y:.3f}",
+                "ra_deg": f"{obj.ra_deg:.8f}",
+                "dec_deg": f"{obj.dec_deg:.8f}",
+                "snr": "" if phot is None else f"{phot.snr:.3f}",
+                "net_flux": "" if phot is None else f"{phot.net_flux:.3f}",
+                "matched_track": "" if match is None else f"AF{match[0] + 1:04d}",
+                "offset_px": "" if offset_px is None else f"{offset_px:.3f}",
+                "offset_arcsec": "" if offset_arcsec is None else f"{offset_arcsec:.3f}",
+            }
+            self.target_rows.append(csv_row)
+            values = [
+                csv_row["object"],
+                csv_row["frame"],
+                csv_row["pred_x"],
+                csv_row["pred_y"],
+                csv_row["snr"],
+                csv_row["net_flux"],
+                csv_row["matched_track"],
+                self._offset_text(offset_px, offset_arcsec),
+            ]
+            for column, value in enumerate(values):
+                self.target_table.setItem(row, column, QTableWidgetItem(value))
+
     def _selected_frame_changed(self) -> None:
         rows = self.frame_table.selectionModel().selectedRows()
         if rows:
@@ -597,16 +845,18 @@ class MainWindow(QMainWindow):
         self._draw_selected_track()
 
     def _draw_selected_track(self) -> None:
-        index = self._selected_track_index()
-        if index is None:
-            return
-        self._draw_track_indices([index])
+        self._draw_current_overlays()
 
     def _draw_checked_tracks(self) -> None:
-        index = self._selected_track_index()
+        self._draw_current_overlays()
+
+    def _draw_current_overlays(self) -> None:
         self.viewer.clear_overlays()
+        index = self._selected_track_index()
         if index is not None:
             self._draw_track_indices([index], clear_first=False)
+        if self.show_predictions.isChecked():
+            self._draw_prediction_overlays()
 
     def _draw_track_indices(self, indices: list[int], *, clear_first: bool = True, mode: str | None = None) -> None:
         if clear_first:
@@ -628,6 +878,15 @@ class MainWindow(QMainWindow):
                 current_index=current_detection_index,
                 color=colors[index % len(colors)],
             )
+
+    def _draw_prediction_overlays(self) -> None:
+        colors = ["#fbbf24", "#34d399", "#a78bfa", "#fb7185", "#38bdf8", "#f97316"]
+        target = self.target_edit.text().strip()
+        objects = self._known_objects_for_current_frame()
+        if target:
+            objects = [obj for obj in objects if self._object_matches_target(obj, target)]
+        for index, obj in enumerate(objects):
+            self.viewer.show_prediction_overlay(obj.x, obj.y, self._object_label(obj), color=colors[index % len(colors)])
 
     def open_selected_movement_graph(self) -> None:
         index = self._selected_track_index()
@@ -705,6 +964,78 @@ class MainWindow(QMainWindow):
             if best_name:
                 self.track_known_matches[track_index] = best_name
 
+    def _nearest_track_detection(self, obj: KnownObject) -> tuple[int, Any, float] | None:
+        if not self.tracks:
+            return None
+        frame_index = self._frame_index_for_object(obj)
+        best: tuple[int, Any, float] | None = None
+        for track_index, track in enumerate(self.tracks):
+            for det in track.detections:
+                if det.frame_index != frame_index:
+                    continue
+                distance = math.hypot(det.source.x - obj.x, det.source.y - obj.y)
+                if best is None or distance < best[2]:
+                    best = (track_index, det, distance)
+        return best
+
+    def _known_objects_for_current_frame(self) -> list[KnownObject]:
+        return [obj for obj in self.known_objects if self._frame_index_for_object(obj) == self._current_frame_index]
+
+    def _frame_index_for_object(self, obj: KnownObject) -> int:
+        frame_name = Path(obj.frame).name
+        for index, frame in enumerate(self.session.frames):
+            if Path(frame.path).name == frame_name:
+                return index
+        return 0
+
+    def _frame_label_for_object(self, obj: KnownObject) -> str:
+        index = self._frame_index_for_object(obj)
+        if 0 <= index < len(self.session.frames):
+            return f"{index}: {Path(self.session.frames[index].path).name}"
+        return Path(obj.frame).name
+
+    def _object_label(self, obj: KnownObject) -> str:
+        if obj.number and obj.name:
+            return f"{obj.number} {obj.name}"
+        return obj.name or obj.number or obj.object_type or "unknown"
+
+    def _object_matches_target(self, obj: KnownObject, target: str) -> bool:
+        needle = target.strip().lower()
+        haystack = " ".join([obj.number, obj.name, obj.object_type, self._object_label(obj)]).lower()
+        return needle in haystack
+
+    def _object_key(self, obj: KnownObject) -> tuple[str, str, str, float, float]:
+        return (Path(obj.frame).name, obj.number, obj.name, round(obj.x, 3), round(obj.y, 3))
+
+    def _expected_motion(self, obj: KnownObject) -> tuple[float | None, float | None]:
+        if obj.ra_rate_arcsec_per_hour is None or obj.dec_rate_arcsec_per_hour is None:
+            return None, None
+        speed = math.hypot(obj.ra_rate_arcsec_per_hour, obj.dec_rate_arcsec_per_hour)
+        pa = (math.degrees(math.atan2(obj.ra_rate_arcsec_per_hour, obj.dec_rate_arcsec_per_hour)) + 360.0) % 360.0
+        return speed, pa
+
+    def _offset_arcsec(self, obj: KnownObject, offset_px: float | None) -> float | None:
+        if offset_px is None:
+            return None
+        frame_index = self._frame_index_for_object(obj)
+        if not (0 <= frame_index < len(self.session.frames)):
+            return None
+        try:
+            image = load_image(self.session.frames[frame_index].path)
+            if image.header is None:
+                return None
+            scale = _pixel_scale_arcsec(WCS(image.header))
+            return None if scale is None else offset_px * scale
+        except Exception:
+            return None
+
+    def _offset_text(self, offset_px: float | None, offset_arcsec: float | None) -> str:
+        if offset_px is None:
+            return ""
+        if offset_arcsec is None:
+            return f"{offset_px:.2f} px"
+        return f"{offset_px:.2f} px / {offset_arcsec:.2f}\""
+
     def _selected_track_index(self) -> int | None:
         rows = self.track_table.selectionModel().selectedRows()
         if not rows:
@@ -720,7 +1051,7 @@ class MainWindow(QMainWindow):
         self.viewer.load_path(frame.path, keep_view=keep_view)
         self.frame_table.selectRow(self._current_frame_index)
         self._update_plate_info(Path(frame.path))
-        self._draw_checked_tracks()
+        self._draw_current_overlays()
 
     def _step_frame(self, delta: int) -> None:
         if self.session.frames:
@@ -1095,6 +1426,7 @@ class TrackChartWidget(QWidget):
         layout.addWidget(self.canvas, 1)
         self.axes: list[Any] = []
         self._points: list[tuple[float, float, float, float]] = []
+        self.on_zoom_changed: Any | None = None
         self.canvas.mpl_connect("button_press_event", self._pick_detection)
         self.canvas.mpl_connect("motion_notify_event", self._hover_detection)
         self.canvas.mpl_connect("scroll_event", self._wheel_zoom)

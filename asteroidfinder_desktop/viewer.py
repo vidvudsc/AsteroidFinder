@@ -121,6 +121,30 @@ class FitsViewer(QGraphicsView):
             dot.setZValue(21)
             self._overlay_items.append(dot)
 
+    def show_prediction_overlay(
+        self,
+        x: float,
+        y: float,
+        label: str,
+        *,
+        color: str = "#fbbf24",
+    ) -> None:
+        pen = QPen(QColor(color), 2.2)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        size = 22.0
+        circle = QGraphicsEllipseItem(QRectF(x - size / 2, y - size / 2, size, size))
+        circle.setPen(pen)
+        circle.setBrush(Qt.BrushStyle.NoBrush)
+        circle.setZValue(30)
+        self._scene.addItem(circle)
+        self._overlay_items.append(circle)
+        hline = self._scene.addLine(x - size, y, x + size, y, pen)
+        vline = self._scene.addLine(x, y - size, x, y + size, pen)
+        hline.setZValue(31)
+        vline.setZValue(31)
+        self._overlay_items.extend([hline, vline])
+        self._add_track_label(label, x, y, color)
+
     def _add_track_label(self, label: str, x: float, y: float, color: str) -> None:
         text = QGraphicsTextItem(label)
         text.setDefaultTextColor(QColor(color))
