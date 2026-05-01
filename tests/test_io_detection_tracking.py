@@ -8,6 +8,7 @@ from astropy.io import fits
 from asteroidfinder.calibration import remove_hot_pixels
 from asteroidfinder.detection import detect_sources
 from asteroidfinder.io import load_image, save_fits
+from asteroidfinder.mpc import write_detected_track_mpc
 from asteroidfinder.photometry import aperture_photometry
 from asteroidfinder.tracking import track_moving_objects
 
@@ -89,3 +90,45 @@ def test_track_moving_object_on_synthetic_sequence(tmp_path: Path) -> None:
     assert abs(best.velocity_x - 5) < 1.5
     assert abs(best.velocity_y - 3) < 1.5
     assert best.detections[0].photometry is not None
+
+
+def test_detected_track_mpc_export_uses_measured_track(tmp_path: Path) -> None:
+    from asteroidfinder.alignment import align_images
+
+    paths = []
+    yy, xx = np.indices((120, 120))
+    stars = [(20, 20), (80, 30), (45, 90), (95, 95), (15, 75)]
+    for frame in range(3):
+        image = np.zeros((120, 120), dtype=np.float32) + 20
+        for x, y in stars:
+            image += 700 * np.exp(-((xx - x) ** 2 + (yy - y) ** 2) / 5)
+        image += 600 * np.exp(-((xx - (30 + frame * 5)) ** 2 + (yy - (40 + frame * 3)) ** 2) / 5)
+        header = fits.Header()
+        header["DATE-OBS"] = f"2026-01-01T00:0{frame}:00"
+        header["CTYPE1"] = "RA---TAN"
+        header["CTYPE2"] = "DEC--TAN"
+        header["CRPIX1"] = 60.0
+        header["CRPIX2"] = 60.0
+        header["CRVAL1"] = 100.0
+        header["CRVAL2"] = 20.0
+        header["CDELT1"] = -0.00028
+        header["CDELT2"] = 0.00028
+        header["FILTER"] = "r"
+        header["MAGZP"] = 25.0
+        path = tmp_path / f"frame_{frame}.fits"
+        save_fits(image, path, header)
+        paths.append(path)
+
+    aligned = align_images(paths)
+    tracks = track_moving_objects(paths, sigma=5, min_detections=3)
+    mpc_path = tmp_path / "measured_mpc.txt"
+    csv_path = tmp_path / "measured.csv"
+
+    write_detected_track_mpc(tracks, aligned, mpc_path, observatory_code="500", csv_path=csv_path)
+
+    text = mpc_path.read_text()
+    assert "measured centroids" in text
+    assert "AF0001" in text
+    rows = csv_path.read_text().splitlines()
+    assert rows[0].startswith("track_id,frame_index")
+    assert len(rows) >= 4

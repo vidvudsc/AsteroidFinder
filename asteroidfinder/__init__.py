@@ -24,6 +24,12 @@ from .known_objects import (
     query_known_objects_in_frame,
     write_mpc_observations,
 )
+from .mpc import (
+    DetectedTrackObservation,
+    measured_observations_from_tracks,
+    write_detected_track_mpc,
+    write_detected_track_observations_csv,
+)
 from .platesolve import PlateSolution, solve_image
 from .photometry import Photometry, aperture_photometry
 from .tracking import Track, TrackDetection, track_aligned_frames, track_moving_objects
@@ -35,6 +41,7 @@ __all__ = [
     "AsteroidWorkflowResult",
     "CalibrationResult",
     "DoctorCheck",
+    "DetectedTrackObservation",
     "PlateSolution",
     "Photometry",
     "KnownObject",
@@ -54,6 +61,7 @@ __all__ = [
     "detect_sources",
     "load_image",
     "make_master_frame",
+    "measured_observations_from_tracks",
     "install_astrometry_indexes",
     "recommend_index_series",
     "remove_hot_pixels",
@@ -61,6 +69,8 @@ __all__ = [
     "query_known_objects_in_frame",
     "plot_track_diagnostics",
     "write_mpc_observations",
+    "write_detected_track_mpc",
+    "write_detected_track_observations_csv",
     "run_asteroid_workflow",
     "run_doctor",
     "save_fits",

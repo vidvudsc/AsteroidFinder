@@ -20,6 +20,7 @@ from asteroidfinder.alignment import AlignedFrame, align_images, stack_images
 from asteroidfinder.diagnostics import plot_track_diagnostics
 from asteroidfinder.io import load_image, save_fits, save_jpeg
 from asteroidfinder.known_objects import query_known_objects_for_frames, write_known_objects_csv
+from asteroidfinder.mpc import write_detected_track_mpc
 from asteroidfinder.platesolve import solve_image
 from asteroidfinder.tracking import Track, track_aligned_frames
 from asteroidfinder.workflow import write_alignment_report, write_tracks_csv
@@ -100,6 +101,13 @@ def main() -> int:
     _write_speed_comparison(tracks, classifications, aligned_known, frame_times, tables_dir / "speed_comparison.csv")
     _write_tracks_gif(aligned, tracks, gif_dir / "detected_tracks.gif")
     plot_track_diagnostics(tracks, diagnostics_dir, frame_times_jd=frame_times)
+    write_detected_track_mpc(
+        tracks,
+        aligned,
+        tables_dir / "detected_track_mpc.txt",
+        observatory_code=OBSERVATORY,
+        csv_path=tables_dir / "detected_track_observations.csv",
+    )
     print(f"  tracks found: {len(tracks)}")
 
     report = _write_report(out, prepared_paths, known, tracks, classifications)
@@ -523,7 +531,7 @@ main{{max-width:1320px;margin:0 auto;padding:32px}} a{{color:#8fd0ff}}
 <h2>Known Objects Summary</h2>
 {_table_html(known_summary_rows)}
 <h2>Files</h2>
-<p><a href="tables/plate_solve_report.csv">plate_solve_report.csv</a> · <a href="tables/known_objects.csv">known_objects.csv</a> · <a href="tables/known_objects_summary.csv">known_objects_summary.csv</a> · <a href="tables/known_objects_aligned_positions.csv">known_objects_aligned_positions.csv</a> · <a href="tables/tracks.csv">tracks.csv</a> · <a href="tables/track_classification.csv">track_classification.csv</a> · <a href="tables/speed_comparison.csv">speed_comparison.csv</a> · <a href="tables/track_vs_known_objects.csv">track_vs_known_objects.csv</a> · <a href="tables/alignment_report.csv">alignment_report.csv</a> · <a href="diagnostics/track_diagnostics.csv">track_diagnostics.csv</a></p>
+<p><a href="tables/plate_solve_report.csv">plate_solve_report.csv</a> · <a href="tables/known_objects.csv">known_objects.csv</a> · <a href="tables/known_objects_summary.csv">known_objects_summary.csv</a> · <a href="tables/known_objects_aligned_positions.csv">known_objects_aligned_positions.csv</a> · <a href="tables/tracks.csv">tracks.csv</a> · <a href="tables/track_classification.csv">track_classification.csv</a> · <a href="tables/speed_comparison.csv">speed_comparison.csv</a> · <a href="tables/track_vs_known_objects.csv">track_vs_known_objects.csv</a> · <a href="tables/detected_track_observations.csv">detected_track_observations.csv</a> · <a href="tables/detected_track_mpc.txt">detected_track_mpc.txt</a> · <a href="tables/alignment_report.csv">alignment_report.csv</a> · <a href="diagnostics/track_diagnostics.csv">track_diagnostics.csv</a></p>
 <p class="muted">Known objects found: {html.escape(', '.join(names))}</p>
 </main></body></html>""",
         encoding="utf-8",
