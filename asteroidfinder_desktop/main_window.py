@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 import csv
+from time import perf_counter
 import webbrowser
 
 from astropy.wcs import WCS
@@ -70,6 +71,7 @@ class MainWindow(QMainWindow):
         self.tracks: list[Track] = []
         self.known_objects: list[KnownObject] = []
         self.track_known_matches: dict[int, str] = {}
+        self._worker_started_at: dict[str, float] = {}
         self._plate_info_cache: dict[Path, tuple[str, str, str, str]] = {}
         self._updating_track_table = False
         self._current_frame_index = 0
@@ -116,6 +118,9 @@ class MainWindow(QMainWindow):
         self.show_full_track = QCheckBox("Show full track")
         self.show_full_track.setToolTip("Off shows one circle on the current frame. On shows every detection and the motion line.")
         self.show_full_track.toggled.connect(lambda _: self._draw_checked_tracks())
+        self.show_known_objects = QCheckBox("Show known objects")
+        self.show_known_objects.setToolTip("Overlay known SkyBoT/MPC object predictions for the selected frame.")
+        self.show_known_objects.toggled.connect(lambda _: self._draw_checked_tracks())
         self.invert_check = QCheckBox("Invert")
         self.blink_slider = QSlider(Qt.Orientation.Horizontal)
         self.blink_slider.setRange(1, 20)
@@ -175,6 +180,7 @@ class MainWindow(QMainWindow):
             ("Report", self.open_report_window),
         ]:
             button = QPushButton(label)
+            button.setMinimumHeight(38)
             button.clicked.connect(handler)
             workflow_layout.addWidget(button)
         layout.addWidget(workflow_box)
@@ -289,6 +295,7 @@ class MainWindow(QMainWindow):
         self.track_table.itemSelectionChanged.connect(self._selected_track_changed)
         layout.addWidget(QLabel("Detected Tracks"))
         layout.addWidget(self.show_full_track)
+        layout.addWidget(self.show_known_objects)
         layout.addWidget(self.track_table, 1)
         graph_row = QHBoxLayout()
         graph_button = QPushButton("Open Movement Chart")
@@ -506,26 +513,33 @@ class MainWindow(QMainWindow):
         self.thread_pool.start(worker)
 
     def _worker_started(self, name: str) -> None:
+        self._worker_started_at[name] = perf_counter()
         self._log(f"Started {name}")
         self.progress_label.setText(f"Running {name}")
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setVisible(True)
 
     def _worker_failed(self, name: str, details: str) -> None:
-        self._log(f"{name} failed")
-        self.progress_label.setText(f"{name} failed")
+        elapsed = self._worker_elapsed_text(name)
+        self._log(f"{name} failed {elapsed}")
+        self.progress_label.setText(f"{name} failed {elapsed}")
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
         self._error(f"{name} failed", _short_error(details))
 
     def _worker_finished(self, name: str, result: object) -> None:
-        self._log(f"Finished {name}")
-        self.progress_label.setText(f"Finished {name}")
+        elapsed = self._worker_elapsed_text(name)
+        self._log(f"Finished {name} {elapsed}")
+        self.progress_label.setText(f"Finished {name} {elapsed}")
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(1)
         self.progress_bar.setVisible(True)
-        if name == "tracking":
+        if name == "calibration":
+            results = list(result) if isinstance(result, list) else []
+            replaced = sum(int(item.hot_pixel_mask.sum()) for item in results if hasattr(item, "hot_pixel_mask"))
+            self._log(f"Hot pixels replaced: {replaced} across {len(results)} frame(s)")
+        elif name == "tracking":
             self.tracks = list(result)  # type: ignore[arg-type]
             self._match_known_objects_to_tracks()
             self._populate_tracks()
@@ -550,6 +564,7 @@ class MainWindow(QMainWindow):
             self._match_known_objects_to_tracks()
             self._populate_tracks()
             self._log(f"Known objects found: {len(self.known_objects)}")
+            self._draw_checked_tracks()
         elif name == "PNG diagnostics":
             paths = [Path(path) for path in result] if isinstance(result, list) else []
             self._log(f"PNG diagnostics written: {len(paths)} file(s) in {self._output_dir() / 'diagnostics'}")
@@ -560,6 +575,12 @@ class MainWindow(QMainWindow):
     def _forget_worker(self, worker: FunctionWorker) -> None:
         if worker in self._workers:
             self._workers.remove(worker)
+
+    def _worker_elapsed_text(self, name: str) -> str:
+        started = self._worker_started_at.pop(name, None)
+        if started is None:
+            return ""
+        return f"({perf_counter() - started:.2f} seconds)"
 
     def _populate_frames(self) -> None:
         self.frame_table.setRowCount(len(self.session.frames))
@@ -619,6 +640,8 @@ class MainWindow(QMainWindow):
         self.viewer.clear_overlays()
         if index is not None:
             self._draw_track_indices([index], clear_first=False)
+        if self.show_known_objects.isChecked():
+            self._draw_known_object_overlays()
 
     def _draw_track_indices(self, indices: list[int], *, clear_first: bool = True, mode: str | None = None) -> None:
         if clear_first:
@@ -640,6 +663,12 @@ class MainWindow(QMainWindow):
                 current_index=current_detection_index,
                 color=colors[index % len(colors)],
             )
+
+    def _draw_known_object_overlays(self) -> None:
+        colors = ["#fbbf24", "#34d399", "#a78bfa", "#fb7185", "#38bdf8", "#f97316"]
+        for index, obj in enumerate(self._known_objects_for_current_frame()):
+            label = obj.name or obj.number or obj.object_type or "known"
+            self.viewer.show_prediction_overlay(obj.x, obj.y, label, color=colors[index % len(colors)])
 
     def open_selected_movement_graph(self) -> None:
         index = self._selected_track_index()
@@ -716,6 +745,12 @@ class MainWindow(QMainWindow):
                         best_name = obj.name or obj.number
             if best_name:
                 self.track_known_matches[track_index] = best_name
+
+    def _known_objects_for_current_frame(self) -> list[KnownObject]:
+        if not self.known_objects or not self.session.frames:
+            return []
+        frame_name = Path(self.session.frames[self._current_frame_index].path).name
+        return [obj for obj in self.known_objects if Path(obj.frame).name == frame_name]
 
     def _selected_track_index(self) -> int | None:
         rows = self.track_table.selectionModel().selectedRows()
@@ -899,7 +934,8 @@ def apply_dark_theme(app: QApplication) -> None:
             color: #f6fbff;
             border: 1px solid #2a8cdc;
             border-radius: 4px;
-            padding: 7px 10px;
+            min-height: 34px;
+            padding: 9px 10px;
             font-weight: 600;
         }
         QPushButton:hover {
