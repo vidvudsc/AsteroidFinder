@@ -6,6 +6,7 @@ import numpy as np
 
 from asteroidfinder.io import save_fits
 from asteroidfinder_desktop.session import FrameInfo, SessionState, discover_fits_files, filter_image_files, load_session, save_session
+from asteroidfinder_desktop.viewer import _display_luminance
 
 
 def test_discover_fits_files_only_returns_supported_images(tmp_path: Path) -> None:
@@ -40,3 +41,29 @@ def test_session_round_trip(tmp_path: Path) -> None:
     assert loaded.output_dir == state.output_dir
     assert loaded.frames[0].name == "frame.fits"
     assert loaded.frames[0].has_wcs
+
+
+def test_raw_bayer_preview_uses_same_size_luminance() -> None:
+    data = np.array(
+        [
+            [0, 10, 20, 30],
+            [40, 50, 60, 70],
+            [80, 90, 100, 110],
+            [120, 130, 140, 150],
+        ],
+        dtype=np.float32,
+    )
+
+    preview = _display_luminance(data, {"BAYERPAT": "VALID"})
+
+    assert preview.shape == data.shape
+    assert np.all(preview[:2, :2] == 25)
+    assert np.all(preview[2:, 2:] == 125)
+
+
+def test_mono_preview_keeps_original_pixels() -> None:
+    data = np.arange(9, dtype=np.float32).reshape(3, 3)
+
+    preview = _display_luminance(data, {"BAYERPAT": "INVALID"})
+
+    assert np.array_equal(preview, data)

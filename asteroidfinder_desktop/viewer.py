@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from PySide6.QtCore import QRectF, Qt
@@ -25,12 +26,14 @@ class FitsViewer(QGraphicsView):
         self._overlay_items: list[object] = []
         self._current_path: Path | None = None
         self._current_data: np.ndarray | None = None
+        self._current_header: Any | None = None
         self._image_rect = QRectF()
         self.inverted = False
         self.percentile_low = 0.5
         self.percentile_high = 99.5
         self._zoom = 1.0
         self._data_cache: OrderedDict[Path, np.ndarray] = OrderedDict()
+        self._header_cache: OrderedDict[Path, Any | None] = OrderedDict()
         self._pixmap_cache: OrderedDict[tuple[Path, bool, float, float], QPixmap] = OrderedDict()
         self._cache_bytes = 0
         self._max_cache_bytes = 768 * 1024 * 1024
@@ -46,11 +49,14 @@ class FitsViewer(QGraphicsView):
             image = load_image(path)
             self._current_path = image.path
             self._current_data = image.data
-            self._remember_data(image.path, image.data)
+            self._current_header = image.header
+            self._remember_data(image.path, image.data, image.header)
         else:
             self._data_cache.move_to_end(path)
+            self._header_cache.move_to_end(path)
             self._current_path = path
             self._current_data = cached
+            self._current_header = self._header_cache.get(path)
         self._render_current(keep_view=keep_view)
 
     def set_inverted(self, value: bool) -> None:
@@ -189,7 +195,8 @@ class FitsViewer(QGraphicsView):
         if cached is not None:
             self._pixmap_cache.move_to_end(key)
             return cached
-        stretched = stretch_to_uint8(self._current_data, percentile=(self.percentile_low, self.percentile_high))
+        display_data = _display_luminance(self._current_data, self._current_header)
+        stretched = stretch_to_uint8(display_data, percentile=(self.percentile_low, self.percentile_high))
         if self.inverted:
             stretched = 255 - stretched
         pixmap = QPixmap.fromImage(_gray_qimage(stretched))
@@ -198,18 +205,21 @@ class FitsViewer(QGraphicsView):
         self._trim_cache()
         return pixmap
 
-    def _remember_data(self, path: Path, data: np.ndarray) -> None:
+    def _remember_data(self, path: Path, data: np.ndarray, header: Any | None) -> None:
         old = self._data_cache.pop(path, None)
         if old is not None:
             self._cache_bytes -= int(old.nbytes)
         self._data_cache[path] = data
+        self._header_cache[path] = header
         self._data_cache.move_to_end(path)
+        self._header_cache.move_to_end(path)
         self._cache_bytes += int(data.nbytes)
         self._trim_cache()
 
     def _trim_cache(self) -> None:
         while self._cache_bytes > self._max_cache_bytes and len(self._data_cache) > 1:
             path, data = self._data_cache.popitem(last=False)
+            self._header_cache.pop(path, None)
             self._cache_bytes -= int(data.nbytes)
             for key in list(self._pixmap_cache):
                 if key[0] == path:
@@ -223,3 +233,45 @@ def _gray_qimage(data: np.ndarray) -> QImage:
     height, width = contiguous.shape
     image = QImage(contiguous.data, width, height, width, QImage.Format.Format_Grayscale8)
     return image.copy()
+
+
+def _display_luminance(data: np.ndarray, header: Any | None = None) -> np.ndarray:
+    if data.ndim != 2 or not _is_bayer_mosaic(header):
+        return data
+    return _smooth_bayer_luminance(data)
+
+
+def _is_bayer_mosaic(header: Any | None) -> bool:
+    if header is None:
+        return False
+    bayer = str(header.get("BAYERPAT", "")).strip().upper()
+    if bayer and bayer not in {"INVALID", "NONE", "FALSE", "0"}:
+        return True
+    color_type = str(header.get("COLORTYP", "")).strip().upper()
+    return color_type in {"RGGB", "BGGR", "GRBG", "GBRG"}
+
+
+def _smooth_bayer_luminance(data: np.ndarray) -> np.ndarray:
+    """Build a same-size preview luminance from 2x2 CFA cells.
+
+    Raw one-shot-color FITS frames store red/green/blue samples in a Bayer grid.
+    Displaying those samples directly creates a checkerboard that aliases while
+    zooming. For preview only, average each 2x2 cell and broadcast it back to
+    the original pixel grid so overlay coordinates and image dimensions stay
+    unchanged.
+    """
+
+    arr = np.asarray(data, dtype=np.float32)
+    height, width = arr.shape
+    even_height = height - height % 2
+    even_width = width - width % 2
+    if even_height < 2 or even_width < 2:
+        return arr
+    preview = arr.copy()
+    cells = arr[:even_height, :even_width].reshape(even_height // 2, 2, even_width // 2, 2)
+    averaged = np.nanmean(cells, axis=(1, 3))
+    preview[:even_height:2, :even_width:2] = averaged
+    preview[1:even_height:2, :even_width:2] = averaged
+    preview[:even_height:2, 1:even_width:2] = averaged
+    preview[1:even_height:2, 1:even_width:2] = averaged
+    return preview
