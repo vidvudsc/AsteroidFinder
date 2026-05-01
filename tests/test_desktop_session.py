@@ -21,12 +21,12 @@ def test_discover_fits_files_only_returns_supported_images(tmp_path: Path) -> No
     assert [path.name for path in paths] == ["a.fit", "b.fits"]
 
 
-def test_filter_image_files_accepts_only_fits_like_paths(tmp_path: Path) -> None:
-    raw = [str(tmp_path / "one.fit"), str(tmp_path / "two.fits"), str(tmp_path / "preview.jpg")]
+def test_filter_image_files_accepts_supported_image_paths(tmp_path: Path) -> None:
+    raw = [str(tmp_path / "one.fit"), str(tmp_path / "two.fits"), str(tmp_path / "preview.jpg"), str(tmp_path / "notes.txt")]
 
     paths = filter_image_files(raw)
 
-    assert [path.name for path in paths] == ["one.fit", "two.fits"]
+    assert [path.name for path in paths] == ["one.fit", "two.fits", "preview.jpg"]
 
 
 def test_session_round_trip(tmp_path: Path) -> None:

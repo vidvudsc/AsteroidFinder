@@ -135,9 +135,9 @@ class FitsViewer(QGraphicsView):
         *,
         color: str = "#fbbf24",
     ) -> None:
-        pen = QPen(QColor(color), 2.2)
+        pen = QPen(QColor(color), 2.8)
         pen.setStyle(Qt.PenStyle.DashLine)
-        size = 22.0
+        size = 32.0
         circle = QGraphicsEllipseItem(QRectF(x - size / 2, y - size / 2, size, size))
         circle.setPen(pen)
         circle.setBrush(Qt.BrushStyle.NoBrush)

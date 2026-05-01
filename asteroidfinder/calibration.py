@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 import numpy as np
 from astropy.io import fits
@@ -100,6 +100,7 @@ def calibrate_images_with_persistent_hot_pixels(
     neighbor_sigma: float = 6.0,
     min_center_neighbor_ratio: float = 2.0,
     min_frames: int | None = None,
+    progress_callback: Callable[[int, int, str], None] | None = None,
     **kwargs: object,
 ) -> list[CalibrationResult]:
     """Calibrate images using one conservative persistent hot-pixel map.
@@ -108,7 +109,10 @@ def calibrate_images_with_persistent_hot_pixels(
     must be both isolated and repeatedly hot at the same sensor coordinate.
     """
 
-    grouped_paths = _group_paths_by_shape(paths)
+    all_paths = list(paths)
+    total = max(1, len(all_paths) * 3)
+    done = 0
+    grouped_paths = _group_paths_by_shape(all_paths)
     results = []
     for shape_paths in grouped_paths.values():
         mask = build_persistent_hot_pixel_mask(
@@ -117,13 +121,27 @@ def calibrate_images_with_persistent_hot_pixels(
             neighbor_sigma=neighbor_sigma,
             min_center_neighbor_ratio=min_center_neighbor_ratio,
             min_frames=min_frames,
+            progress_callback=(
+                None
+                if progress_callback is None
+                else lambda step, steps, text: progress_callback(done + step, total, text)
+            ),
         )
+        done += len(shape_paths)
         results.extend(calibrate_image(path, hot_pixel_mask=mask, hot_sigma=hot_sigma, **kwargs) for path in shape_paths)
+        done += len(shape_paths)
+        if progress_callback is not None:
+            progress_callback(done, total, "Applied hot-pixel mask")
     if output_dir is not None:
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         for result in results:
             save_fits(result.data, out_dir / f"{result.image.path.stem}_calibrated.fits", result.image.header)
+            done += 1
+            if progress_callback is not None:
+                progress_callback(done, total, f"Wrote {result.image.path.name}")
+    elif progress_callback is not None:
+        progress_callback(total, total, "Hot-pixel cleaning complete")
     return results
 
 
@@ -135,6 +153,7 @@ def build_persistent_hot_pixel_mask(
     min_center_neighbor_ratio: float = 2.0,
     min_frames: int | None = None,
     filter_size: int = 3,
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> np.ndarray:
     """Build a fixed sensor-coordinate hot-pixel mask from a sequence."""
 
@@ -142,7 +161,8 @@ def build_persistent_hot_pixel_mask(
         raise ValueError("No images provided")
     detections: list[np.ndarray] = []
     shape: tuple[int, int] | None = None
-    for path in paths:
+    total = len(paths)
+    for index, path in enumerate(paths, start=1):
         image = load_image(path).data
         if shape is None:
             shape = image.shape
@@ -160,6 +180,8 @@ def build_persistent_hot_pixel_mask(
                 filter_size=filter_size,
             )
         )
+        if progress_callback is not None:
+            progress_callback(index, total, f"Scanning {Path(path).name}")
     counts = np.sum(np.stack(detections), axis=0)
     required = min_frames if min_frames is not None else max(2, int(np.ceil(len(detections) * 0.8)))
     return counts >= required

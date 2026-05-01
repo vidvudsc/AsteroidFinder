@@ -6,6 +6,8 @@ import json
 
 
 FITS_EXTENSIONS = {".fit", ".fits", ".fts", ".new"}
+RASTER_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
+IMAGE_EXTENSIONS = FITS_EXTENSIONS | RASTER_EXTENSIONS
 
 
 @dataclass
@@ -52,7 +54,7 @@ def discover_fits_files(folder: str | Path) -> list[Path]:
 
 
 def filter_image_files(paths: list[str] | tuple[str, ...] | list[Path]) -> list[Path]:
-    return [Path(path).expanduser() for path in paths if Path(path).suffix.lower() in FITS_EXTENSIONS]
+    return [Path(path).expanduser() for path in paths if Path(path).suffix.lower() in IMAGE_EXTENSIONS]
 
 
 def save_session(state: SessionState, path: str | Path) -> Path:

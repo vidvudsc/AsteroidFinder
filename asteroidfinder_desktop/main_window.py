@@ -53,7 +53,7 @@ from asteroidfinder.report import generate_html_report
 from asteroidfinder.tracking import Track, track_moving_objects
 from asteroidfinder.workflow import run_asteroid_workflow
 
-from .session import FITS_EXTENSIONS, FrameInfo, SessionState, filter_image_files, save_session
+from .session import FITS_EXTENSIONS, IMAGE_EXTENSIONS, FrameInfo, SessionState, filter_image_files, save_session
 from .viewer import FitsViewer
 from .workers import FunctionWorker
 
@@ -348,12 +348,13 @@ class MainWindow(QMainWindow):
         self.blink_slider.valueChanged.connect(lambda _: self._blink_timer.setInterval(self._blink_interval_ms()))
 
     def import_images(self) -> None:
-        suffixes = " ".join(f"*{suffix}" for suffix in sorted(FITS_EXTENSIONS))
+        image_suffixes = " ".join(f"*{suffix}" for suffix in sorted(IMAGE_EXTENSIONS))
+        fits_suffixes = " ".join(f"*{suffix}" for suffix in sorted(FITS_EXTENSIONS))
         files, _ = QFileDialog.getOpenFileNames(
             self,
-            "Import FITS images",
+            "Import images",
             str(Path.home()),
-            f"FITS images ({suffixes});;All files (*)",
+            f"Supported images ({image_suffixes});;FITS images ({fits_suffixes});;All files (*)",
         )
         if not files:
             return
@@ -409,9 +410,12 @@ class MainWindow(QMainWindow):
         self._sync_settings()
         out_dir = self._output_dir() / "solved"
 
-        def solve_all() -> list[Path]:
+        def solve_all(progress_callback: object | None = None) -> list[Path]:
             solved = []
-            for path in paths:
+            total = len(paths)
+            for index, path in enumerate(paths, start=1):
+                if callable(progress_callback):
+                    progress_callback(index - 1, total, f"Solving {Path(path).name}")
                 result = solve_image(
                     path,
                     output_dir=out_dir,
@@ -421,6 +425,8 @@ class MainWindow(QMainWindow):
                     timeout=self.solve_timeout.value(),
                 )
                 solved.append(result.solved_fits or result.path)
+                if callable(progress_callback):
+                    progress_callback(index, total, f"Solved {Path(path).name}")
             return solved
 
         self._start_worker("plate solve", solve_all)
@@ -542,6 +548,7 @@ class MainWindow(QMainWindow):
     def _start_worker(self, name: str, fn: Any, *args: Any, **kwargs: Any) -> None:
         worker = FunctionWorker(name, fn, *args, **kwargs)
         worker.signals.started.connect(self._worker_started)
+        worker.signals.progress.connect(self._worker_progress)
         worker.signals.failed.connect(self._worker_failed)
         worker.signals.finished.connect(self._worker_finished)
         worker.signals.finished.connect(lambda *_: self._forget_worker(worker))
@@ -555,6 +562,16 @@ class MainWindow(QMainWindow):
         self.progress_label.setText(f"Running {name}")
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setVisible(True)
+
+    def _worker_progress(self, name: str, done: int, total: int, text: str) -> None:
+        if total <= 0:
+            self.progress_bar.setRange(0, 0)
+            self.progress_label.setText(f"Running {name}")
+            return
+        self.progress_bar.setRange(0, total)
+        self.progress_bar.setValue(max(0, min(done, total)))
+        suffix = f": {text}" if text else ""
+        self.progress_label.setText(f"{name} {done}/{total}{suffix}")
 
     def _worker_failed(self, name: str, details: str) -> None:
         elapsed = self._worker_elapsed_text(name)

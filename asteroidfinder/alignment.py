@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 import astroalign as aa
 import numpy as np
@@ -32,13 +32,17 @@ def align_images(
     output_dir: str | Path | None = None,
     crop_overlap: bool = False,
     prefer_translation: bool = True,
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> list[AlignedFrame]:
     """Align images to a reference using star-pattern matching."""
 
     if not paths:
         raise ValueError("No images provided")
 
+    total = max(1, len(paths) * 2 + 1)
     loaded = [load_image(path) for path in paths]
+    if progress_callback is not None:
+        progress_callback(1, total, "Loaded reference frame")
     reference_image = load_image(reference) if reference is not None else loaded[0]
     result = [
         AlignedFrame(
@@ -50,20 +54,31 @@ def align_images(
     ]
 
     start = 1 if reference is None else 0
+    done = 1
     for image in loaded[start:]:
+        if progress_callback is not None:
+            progress_callback(done, total, f"Aligning {image.path.name}")
         transform, aligned, footprint, method = _align_one(image.data, reference_image.data, prefer_translation=prefer_translation)
         rms_error, matched_sources = measure_alignment_error(aligned, reference_image.data)
         frame = AlignedFrame(image, aligned, transform, footprint, method, rms_error, matched_sources)
         result.append(frame)
+        done += 1
+        if progress_callback is not None:
+            progress_callback(done, total, f"Aligned {image.path.name}")
 
     if crop_overlap:
         result = crop_to_common_overlap(result)
+        if progress_callback is not None:
+            progress_callback(done, total, "Cropped common overlap")
 
     out_dir = Path(output_dir) if output_dir is not None else None
     if out_dir is not None:
         out_dir.mkdir(parents=True, exist_ok=True)
         for frame in result:
             save_fits(frame.data, out_dir / f"{frame.image.path.stem}_aligned.fits", frame.image.header)
+            done += 1
+            if progress_callback is not None:
+                progress_callback(done, total, f"Wrote {frame.image.path.name}")
     return result
 
 
