@@ -53,7 +53,7 @@ from asteroidfinder.report import generate_html_report
 from asteroidfinder.tracking import Track, track_moving_objects
 from asteroidfinder.workflow import run_asteroid_workflow
 
-from .session import FITS_EXTENSIONS, IMAGE_EXTENSIONS, FrameInfo, SessionState, filter_image_files, save_session
+from .session import FITS_EXTENSIONS, IMAGE_EXTENSIONS, FrameInfo, SessionState, filter_image_files, natural_sorted, save_session
 from .viewer import FitsViewer
 from .workers import FunctionWorker
 
@@ -367,7 +367,7 @@ class MainWindow(QMainWindow):
         if not paths:
             self._error("No supported images", "Choose FITS, FIT, FTS, or solved .new files.")
             return
-        paths = sorted(paths)
+        paths = natural_sorted(paths)
         common_parent = paths[0].parent
         self.session.input_dir = str(common_parent)
         self.session.output_dir = self.session.output_dir or str(common_parent / "asteroidfinder_output")
@@ -861,7 +861,9 @@ class MainWindow(QMainWindow):
         self._current_frame_index = index % len(self.session.frames)
         frame = self.session.frames[self._current_frame_index]
         self.viewer.load_path(frame.path, keep_view=keep_view)
+        signals_blocked = self.frame_table.blockSignals(True)
         self.frame_table.selectRow(self._current_frame_index)
+        self.frame_table.blockSignals(signals_blocked)
         self._update_plate_info(Path(frame.path))
         self._draw_checked_tracks()
 
@@ -880,11 +882,11 @@ class MainWindow(QMainWindow):
         require_same_shape: bool = False,
     ) -> list[Path]:
         if prefer_aligned:
-            aligned = sorted((self._output_dir() / "aligned").glob("*_aligned.fits"))
+            aligned = natural_sorted((self._output_dir() / "aligned").glob("*_aligned.fits"))
             if aligned:
                 return self._validate_paths(aligned, require_same_shape=require_same_shape)
         if prefer_solved:
-            solved = sorted((self._output_dir() / "solved").glob("*.new"))
+            solved = natural_sorted((self._output_dir() / "solved").glob("*.new"))
             if solved:
                 return self._validate_paths(solved, require_same_shape=require_same_shape)
         paths = self.session.frame_paths()
