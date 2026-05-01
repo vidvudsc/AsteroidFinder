@@ -6,8 +6,10 @@ import csv
 import webbrowser
 
 from astropy.wcs import WCS
-from PySide6.QtCore import QPointF, QRectF, QSize, QThreadPool, QTimer, Qt
-from PySide6.QtGui import QAction, QBrush, QColor, QFont, QMouseEvent, QPainter, QPalette, QPen, QWheelEvent
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
+from matplotlib.figure import Figure
+from PySide6.QtCore import QThreadPool, QTimer, Qt
+from PySide6.QtGui import QAction, QColor, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -26,7 +28,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
-    QSizePolicy,
     QSlider,
     QSpinBox,
     QSplitter,
@@ -1092,19 +1093,6 @@ def _range_with_padding(values: list[float], padding_fraction: float = 0.12) -> 
     return low - pad, high + pad
 
 
-def _aspect_rect(rect: QRectF, data_width: float, data_height: float) -> QRectF:
-    if data_width <= 0 or data_height <= 0 or rect.width() <= 0 or rect.height() <= 0:
-        return rect
-    data_aspect = data_width / data_height
-    rect_aspect = rect.width() / rect.height()
-    if rect_aspect > data_aspect:
-        width = rect.height() * data_aspect
-        left = rect.left() + (rect.width() - width) / 2.0
-        return QRectF(left, rect.top(), width, rect.height())
-    height = rect.width() / data_aspect
-    top = rect.top() + (rect.height() - height) / 2.0
-    return QRectF(rect.left(), top, rect.width(), height)
-
 
 class TrackChartWidget(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -1113,14 +1101,21 @@ class TrackChartWidget(QWidget):
         self.track_index = 0
         self.known_name = ""
         self.frame_size: tuple[int, int] | None = None
-        self.selected_offset: int | None = None
+        self.selected_offset = 0
         self.on_selected_offset: Any | None = None
-        self.on_zoom_changed: Any | None = None
-        self._hit_points: list[tuple[QPointF, int]] = []
         self.zoom = 100
-        self.setMouseTracking(True)
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.figure = Figure(figsize=(10, 6), dpi=100, facecolor="#0b111a")
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        self.toolbar = NavigationToolbar2QT(self.canvas, self)
+        layout.addWidget(self.toolbar)
+        layout.addWidget(self.canvas, 1)
+        self.axes: list[Any] = []
+        self._points: list[tuple[float, float, float, float]] = []
+        self.canvas.mpl_connect("button_press_event", self._pick_detection)
+        self.canvas.mpl_connect("motion_notify_event", self._hover_detection)
+        self.canvas.mpl_connect("scroll_event", self._wheel_zoom)
 
     def set_track(
         self,
@@ -1134,264 +1129,165 @@ class TrackChartWidget(QWidget):
         self.track_index = track_index
         self.known_name = known_name
         self.frame_size = frame_size
-        self.selected_offset = selected_offset
-        self.update()
+        self.selected_offset = selected_offset or 0
+        self._draw()
 
     def set_zoom(self, zoom: int) -> None:
         self.zoom = max(25, min(500, zoom))
-        self.update()
+        self._draw()
 
-    def sizeHint(self) -> QSize:
-        return QSize(1120, 760)
-
-    def paintEvent(self, event: object) -> None:  # noqa: N802
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), QColor("#070b11"))
+    def _draw(self) -> None:
+        self.figure.clear()
+        self.figure.set_facecolor("#0b111a")
         if self.track is None:
-            painter.setPen(QColor("#9fb2c5"))
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No track selected")
+            self.canvas.draw_idle()
+            return
+        detections = sorted(self.track.detections, key=lambda item: item.frame_index)
+        self._points = [(float(det.frame_index), float(det.source.x), float(det.source.y), float(det.source.snr)) for det in detections]
+        if not self._points:
+            self.canvas.draw_idle()
             return
 
-        track = self.track
-        detections = sorted(track.detections, key=lambda det: det.frame_index)
-        points = [(float(det.frame_index), float(det.source.x), float(det.source.y), float(det.source.snr)) for det in detections]
-        if not points:
-            painter.setPen(QColor("#9fb2c5"))
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Track has no detections")
-            return
+        grid = self.figure.add_gridspec(2, 2, width_ratios=[1.25, 1.0], height_ratios=[1.0, 1.0], wspace=0.28, hspace=0.32)
+        ax_path = self.figure.add_subplot(grid[:, 0])
+        ax_x = self.figure.add_subplot(grid[0, 1])
+        ax_y = self.figure.add_subplot(grid[1, 1], sharex=ax_x)
+        self.axes = [ax_path, ax_x, ax_y]
+        self._style_axis(ax_path)
+        self._style_axis(ax_x)
+        self._style_axis(ax_y)
 
-        self._hit_points = []
-        margin = 28
-        header_h = 82
-        gap = 18
-        body = self.rect().adjusted(margin, header_h, -margin, -margin)
-        left_w = int(body.width() * 0.55)
-        path_rect = QRectF(body.left(), body.top(), left_w, body.height())
-        right_x = path_rect.right() + gap
-        right_w = body.right() - right_x
-        x_rect = QRectF(right_x, body.top(), right_w, (body.height() - gap) / 2)
-        y_rect = QRectF(right_x, x_rect.bottom() + gap, right_w, (body.height() - gap) / 2)
+        frames = [point[0] for point in self._points]
+        xs = [point[1] for point in self._points]
+        ys = [point[2] for point in self._points]
+        fit_x = _linear_fit(list(zip(frames, xs)))
+        fit_y = _linear_fit(list(zip(frames, ys)))
+        fit_xs = [fit_x[0] * frame + fit_x[1] for frame in frames]
+        fit_ys = [fit_y[0] * frame + fit_y[1] for frame in frames]
 
-        self._draw_header(painter, track)
-        self._draw_path_panel(painter, path_rect, points)
-        self._draw_series_panel(painter, x_rect, points, axis="x")
-        self._draw_series_panel(painter, y_rect, points, axis="y")
-
-    def _draw_header(self, painter: QPainter, track: Track) -> None:
-        title_font = QFont()
-        title_font.setPointSize(17)
-        title_font.setBold(True)
-        painter.setFont(title_font)
-        painter.setPen(QColor("#e8f3ff"))
-        name = f"AF{self.track_index + 1:04d}"
-        if self.known_name:
-            name += f"  matched {self.known_name}"
-        painter.drawText(28, 34, name)
-
-        speed = f"{track.angular_rate_arcsec_per_frame:.3f} arcsec/frame" if track.angular_rate_arcsec_per_frame is not None else "sky speed unknown"
-        pa = f"{track.position_angle_deg:.1f} deg" if track.position_angle_deg is not None else "PA unknown"
-        pixel_speed = (track.velocity_x**2 + track.velocity_y**2) ** 0.5
-        subtitle = (
-            f"{len(track.detections)} detections   "
-            f"pixel speed {pixel_speed:.3f} px/frame   "
-            f"vx {track.velocity_x:.3f}, vy {track.velocity_y:.3f}   "
-            f"{speed}   {pa}   score {track.score:.3f}"
-        )
-        detail_font = QFont()
-        detail_font.setPointSize(10)
-        painter.setFont(detail_font)
-        painter.setPen(QColor("#9fb2c5"))
-        painter.drawText(28, 62, subtitle)
-
-    def _draw_panel(self, painter: QPainter, rect: QRectF, title: str) -> None:
-        painter.setPen(QPen(QColor("#26364a"), 1))
-        painter.setBrush(QBrush(QColor("#0c1420")))
-        painter.drawRoundedRect(rect, 6, 6)
-        painter.setPen(QColor("#dbe7f3"))
-        font = QFont()
-        font.setPointSize(11)
-        font.setBold(True)
-        painter.setFont(font)
-        painter.drawText(rect.adjusted(14, 12, -14, -12), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, title)
-        painter.setPen(QPen(QColor("#1d2a3a"), 1))
-        plot = rect.adjusted(48, 54, -22, -38)
-        for i in range(1, 5):
-            x = plot.left() + plot.width() * i / 5
-            y = plot.top() + plot.height() * i / 5
-            painter.drawLine(QPointF(x, plot.top()), QPointF(x, plot.bottom()))
-            painter.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y))
-        painter.setPen(QPen(QColor("#3b4c62"), 1))
-        painter.drawRect(plot)
-
-    def _draw_path_panel(self, painter: QPainter, rect: QRectF, points: list[tuple[float, float, float, float]]) -> None:
-        self._draw_panel(painter, rect, "Full-frame motion")
-        plot = rect.adjusted(48, 54, -22, -38)
-        if self.frame_size is None:
-            xs = [x for _, x, _, _ in points]
-            ys = [y for _, _, y, _ in points]
-            min_x, max_x = _range_with_padding(xs)
-            min_y, max_y = _range_with_padding(ys)
+        ax_path.plot(xs, ys, color="#38bdf8", linewidth=2.0, marker="o", markersize=5, label="detections")
+        ax_path.plot(fit_xs, fit_ys, color="#fbbf24", linestyle="--", linewidth=1.5, label="linear fit")
+        selected = self._selected_point()
+        ax_path.scatter([selected[1]], [selected[2]], s=130, facecolors="none", edgecolors="#ff4f8b", linewidths=2.2, zorder=6)
+        for frame, x, y, _snr in self._points:
+            ax_path.annotate(f"F{int(frame)}", (x, y), xytext=(5, 5), textcoords="offset points", color="#dbe7f3", fontsize=8)
+        if self.frame_size is not None:
+            ax_path.set_xlim(0, self.frame_size[0])
+            ax_path.set_ylim(0, self.frame_size[1])
         else:
-            min_x, max_x = 0.0, float(self.frame_size[0])
-            min_y, max_y = 0.0, float(self.frame_size[1])
-        center_x, center_y = self._selected_xy(points)
-        min_x, max_x = self._zoomed_range(min_x, max_x, center_x)
-        min_y, max_y = self._zoomed_range(min_y, max_y, center_y)
-        plot = _aspect_rect(plot, max_x - min_x, max_y - min_y)
-        self._draw_tick_labels(painter, plot, min_x, max_x, min_y, max_y)
+            ax_path.set_xlim(*_range_with_padding(xs))
+            ax_path.set_ylim(*_range_with_padding(ys))
+        ax_path.set_aspect("equal", adjustable="box")
+        ax_path.set_title("Full-frame motion", color="#e8f3ff")
+        ax_path.set_xlabel("x pixel", color="#9fb2c5")
+        ax_path.set_ylabel("y pixel", color="#9fb2c5")
+        ax_path.legend(facecolor="#0f1722", edgecolor="#26364a", labelcolor="#dbe7f3", fontsize=8)
 
-        def map_point(x: float, y: float) -> QPointF:
-            px = plot.left() + (x - min_x) / max(max_x - min_x, 1e-9) * plot.width()
-            py = plot.bottom() - (y - min_y) / max(max_y - min_y, 1e-9) * plot.height()
-            return QPointF(px, py)
+        self._plot_series(ax_x, frames, xs, fit_x, "X position", "#34d399")
+        self._plot_series(ax_y, frames, ys, fit_y, "Y position", "#a78bfa")
+        self._apply_zoom()
+        self.figure.suptitle(self._title(), color="#e8f3ff", fontsize=12)
+        self.canvas.draw_idle()
 
-        fit_x = _linear_fit([(frame, x) for frame, x, _, _ in points])
-        fit_y = _linear_fit([(frame, y) for frame, _, y, _ in points])
-        frame_low = min(frame for frame, *_ in points)
-        frame_high = max(frame for frame, *_ in points)
-        fitted_start = map_point(fit_x[0] * frame_low + fit_x[1], fit_y[0] * frame_low + fit_y[1])
-        fitted_end = map_point(fit_x[0] * frame_high + fit_x[1], fit_y[0] * frame_high + fit_y[1])
-
-        mapped = [map_point(x, y) for _, x, y, _ in points]
-        painter.save()
-        painter.setClipRect(plot.adjusted(-1, -1, 1, 1))
-        painter.setPen(QPen(QColor("#2a8cdc"), 2.5))
-        for start, end in zip(mapped, mapped[1:]):
-            painter.drawLine(start, end)
-        painter.setPen(QPen(QColor("#fbbf24"), 1.8, Qt.PenStyle.DashLine))
-        painter.drawLine(fitted_start, fitted_end)
-
-        for idx, (frame, _x, _y, snr) in enumerate(points):
-            point = mapped[idx]
-            radius = max(4.0, min(10.0, 3.5 + snr / 10.0))
-            painter.setPen(QPen(QColor("#ffffff"), 1))
-            painter.setBrush(QBrush(QColor("#38bdf8")))
-            painter.drawEllipse(point, radius, radius)
-            if idx == self.selected_offset:
-                painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.setPen(QPen(QColor("#ff4f8b"), 2.6))
-                painter.drawEllipse(point, radius + 8, radius + 8)
-                painter.drawLine(QPointF(point.x() - 14, point.y()), QPointF(point.x() + 14, point.y()))
-                painter.drawLine(QPointF(point.x(), point.y() - 14), QPointF(point.x(), point.y() + 14))
-            painter.setPen(QColor("#dbe7f3"))
-            painter.drawText(QPointF(point.x() + 8, point.y() - 8), f"F{int(frame)}")
-            self._hit_points.append((point, idx))
-        painter.restore()
-
-        self._draw_axis_labels(painter, plot, f"x {min_x:.1f}..{max_x:.1f}", f"y {min_y:.1f}..{max_y:.1f}")
-
-    def _draw_series_panel(self, painter: QPainter, rect: QRectF, points: list[tuple[float, float, float, float]], *, axis: str) -> None:
-        value_index = 1 if axis == "x" else 2
-        label = "X position trend" if axis == "x" else "Y position trend"
-        color = QColor("#34d399") if axis == "x" else QColor("#a78bfa")
-        self._draw_panel(painter, rect, label)
-        plot = rect.adjusted(48, 54, -22, -38)
-        frames = [frame for frame, *_ in points]
-        values = [point[value_index] for point in points]
-        min_f, max_f = _range_with_padding(frames, 0.08)
-        selected_frame = points[min(self.selected_offset or 0, len(points) - 1)][0]
-        min_f, max_f = self._zoomed_range(min_f, max_f, selected_frame)
-        min_v, max_v = _range_with_padding(values)
-        fit = _linear_fit([(frame, value) for frame, value in zip(frames, values)])
-        self._draw_tick_labels(painter, plot, min_f, max_f, min_v, max_v)
-
-        def map_point(frame: float, value: float) -> QPointF:
-            px = plot.left() + (frame - min_f) / max(max_f - min_f, 1e-9) * plot.width()
-            py = plot.bottom() - (value - min_v) / max(max_v - min_v, 1e-9) * plot.height()
-            return QPointF(px, py)
-
-        mapped = [map_point(frame, value) for frame, value in zip(frames, values)]
-        painter.save()
-        painter.setClipRect(plot.adjusted(-1, -1, 1, 1))
-        painter.setPen(QPen(color, 2))
-        for start, end in zip(mapped, mapped[1:]):
-            painter.drawLine(start, end)
-        painter.setPen(QPen(QColor("#fbbf24"), 1.6, Qt.PenStyle.DashLine))
-        painter.drawLine(map_point(min(frames), fit[0] * min(frames) + fit[1]), map_point(max(frames), fit[0] * max(frames) + fit[1]))
-
-        painter.setBrush(QBrush(color))
-        painter.setPen(QPen(QColor("#ffffff"), 1))
-        for index, point in enumerate(mapped):
-            painter.drawEllipse(point, 4.5, 4.5)
-            if index == self.selected_offset:
-                painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.setPen(QPen(QColor("#ff4f8b"), 2.0))
-                painter.drawLine(QPointF(point.x(), plot.top()), QPointF(point.x(), plot.bottom()))
-                painter.drawEllipse(point, 8.0, 8.0)
-                painter.setBrush(QBrush(color))
-                painter.setPen(QPen(QColor("#ffffff"), 1))
-        painter.restore()
-
+    def _plot_series(self, axis: Any, frames: list[float], values: list[float], fit: tuple[float, float], title: str, color: str) -> None:
+        fitted = [fit[0] * frame + fit[1] for frame in frames]
+        axis.plot(frames, values, color=color, linewidth=1.8, marker="o", markersize=4)
+        axis.plot(frames, fitted, color="#fbbf24", linestyle="--", linewidth=1.3)
+        selected = self._selected_point()
+        value = selected[1] if title.startswith("X") else selected[2]
+        axis.axvline(selected[0], color="#ff4f8b", linewidth=1.1, alpha=0.75)
+        axis.scatter([selected[0]], [value], s=80, facecolors="none", edgecolors="#ff4f8b", linewidths=1.8, zorder=6)
         residuals = [value - (fit[0] * frame + fit[1]) for frame, value in zip(frames, values)]
         rms = (sum(value * value for value in residuals) / len(residuals)) ** 0.5 if residuals else 0.0
-        painter.setPen(QColor("#9fb2c5"))
-        painter.drawText(rect.adjusted(14, 30, -14, -10), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, f"slope {fit[0]:.4f} px/frame   RMS {rms:.3f} px")
-        self._draw_axis_labels(painter, plot, f"frame {min(frames):.0f}..{max(frames):.0f}", f"{axis} {min_v:.1f}..{max_v:.1f}")
+        axis.set_title(f"{title}   slope {fit[0]:.4f} px/frame   RMS {rms:.3f}", color="#e8f3ff", fontsize=10)
+        axis.set_xlabel("frame", color="#9fb2c5")
+        axis.set_ylabel("pixel", color="#9fb2c5")
+        axis.set_xlim(*_range_with_padding(frames, 0.08))
+        axis.set_ylim(*_range_with_padding(values))
 
-    def _draw_axis_labels(self, painter: QPainter, plot: QRectF, x_text: str, y_text: str) -> None:
-        painter.setPen(QColor("#72849a"))
-        font = QFont()
-        font.setPointSize(9)
-        painter.setFont(font)
-        painter.drawText(QPointF(plot.left(), plot.bottom() + 22), x_text)
-        painter.drawText(QPointF(plot.left() - 4, plot.top() - 10), y_text)
+    def _style_axis(self, axis: Any) -> None:
+        axis.set_facecolor("#0f1722")
+        axis.tick_params(colors="#9fb2c5", labelsize=8)
+        axis.grid(True, color="#26364a", linewidth=0.7, alpha=0.8)
+        for spine in axis.spines.values():
+            spine.set_color("#3b4c62")
 
-    def _draw_tick_labels(self, painter: QPainter, plot: QRectF, min_x: float, max_x: float, min_y: float, max_y: float) -> None:
-        painter.setPen(QColor("#6f8195"))
-        font = QFont()
-        font.setPointSize(8)
-        painter.setFont(font)
-        for i in range(3):
-            fraction = i / 2
-            x = plot.left() + plot.width() * fraction
-            y = plot.bottom() - plot.height() * fraction
-            x_value = min_x + (max_x - min_x) * fraction
-            y_value = min_y + (max_y - min_y) * fraction
-            painter.drawText(QPointF(x - 16, plot.bottom() + 12), f"{x_value:.0f}")
-            painter.drawText(QPointF(plot.left() - 42, y + 4), f"{y_value:.0f}")
-
-    def _selected_xy(self, points: list[tuple[float, float, float, float]]) -> tuple[float, float]:
-        index = min(self.selected_offset or 0, len(points) - 1)
-        return points[index][1], points[index][2]
-
-    def _zoomed_range(self, low: float, high: float, center: float) -> tuple[float, float]:
-        span = max(high - low, 1e-9)
+    def _apply_zoom(self) -> None:
+        if not self.axes or not self._points:
+            return
         if self.zoom <= 100:
+            return
+        selected = self._selected_point()
+        path_axis, x_axis, y_axis = self.axes
+        for axis, center_x, center_y in [
+            (path_axis, selected[1], selected[2]),
+            (x_axis, selected[0], selected[1]),
+            (y_axis, selected[0], selected[2]),
+        ]:
+            x_low, x_high = axis.get_xlim()
+            y_low, y_high = axis.get_ylim()
+            axis.set_xlim(*self._zoomed_limits(x_low, x_high, center_x))
+            axis.set_ylim(*self._zoomed_limits(y_low, y_high, center_y))
+
+    def _zoomed_limits(self, low: float, high: float, center: float) -> tuple[float, float]:
+        span = abs(high - low)
+        if span <= 1e-9:
             return low, high
         visible = span * 100.0 / self.zoom
         half = visible / 2.0
-        new_low = center - half
-        new_high = center + half
-        if new_low < low:
-            new_high += low - new_low
-            new_low = low
-        if new_high > high:
-            new_low -= new_high - high
-            new_high = high
-        return new_low, new_high
+        return center - half, center + half
 
-    def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802
-        delta = event.angleDelta().y()
-        if delta == 0:
+    def _selected_point(self) -> tuple[float, float, float, float]:
+        index = min(max(self.selected_offset, 0), len(self._points) - 1)
+        return self._points[index]
+
+    def _pick_detection(self, event: Any) -> None:
+        self._select_from_event(event)
+
+    def _hover_detection(self, event: Any) -> None:
+        self._select_from_event(event)
+
+    def _select_from_event(self, event: Any) -> None:
+        if event.inaxes is None or not self._points:
             return
-        factor = 1.18 if delta > 0 else 1 / 1.18
-        self.set_zoom(int(self.zoom * factor))
+        candidates: list[tuple[float, int]] = []
+        for index, point in enumerate(self._points):
+            if event.inaxes == self.axes[0]:
+                x_data, y_data = point[1], point[2]
+            elif event.inaxes == self.axes[1]:
+                x_data, y_data = point[0], point[1]
+            elif event.inaxes == self.axes[2]:
+                x_data, y_data = point[0], point[2]
+            else:
+                continue
+            screen_x, screen_y = event.inaxes.transData.transform((x_data, y_data))
+            candidates.append(((screen_x - event.x) ** 2 + (screen_y - event.y) ** 2, index))
+        if not candidates:
+            return
+        distance_sq, index = min(candidates)
+        if distance_sq <= 14**2 and index != self.selected_offset and self.on_selected_offset is not None:
+            self.on_selected_offset(index)
+
+    def _wheel_zoom(self, event: Any) -> None:
+        if event.step == 0:
+            return
+        factor = 1.22 if event.step > 0 else 1 / 1.22
+        self.zoom = max(25, min(500, int(self.zoom * factor)))
         if self.on_zoom_changed is not None:
             self.on_zoom_changed(self.zoom)
-        event.accept()
+        self._draw()
 
-    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
-        if not self._hit_points:
-            return
-        pos = event.position()
-        best_point, best_offset = min(
-            self._hit_points,
-            key=lambda item: (item[0].x() - pos.x()) ** 2 + (item[0].y() - pos.y()) ** 2,
+    def _title(self) -> str:
+        if self.track is None:
+            return ""
+        pixel_speed = (self.track.velocity_x**2 + self.track.velocity_y**2) ** 0.5
+        known = f"  matched {self.known_name}" if self.known_name else ""
+        return (
+            f"AF{self.track_index + 1:04d}{known}   "
+            f"{len(self.track.detections)} detections   "
+            f"speed {pixel_speed:.3f} px/frame   "
+            f"score {self.track.score:.3f}"
         )
-        distance_sq = (best_point.x() - pos.x()) ** 2 + (best_point.y() - pos.y()) ** 2
-        if distance_sq <= 18**2 and best_offset != self.selected_offset and self.on_selected_offset is not None:
-            self.on_selected_offset(best_offset)
 
 
 class DiagnosticWindow(QDialog):
