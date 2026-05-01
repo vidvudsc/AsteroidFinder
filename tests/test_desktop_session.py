@@ -91,8 +91,8 @@ def test_initial_progress_totals_for_slow_desktop_steps() -> None:
     paths = [Path("a.fit"), Path("b.fit"), Path("c.fit")]
 
     assert _initial_progress_total("plate solve", (paths,)) == 3
-    assert _initial_progress_total("calibration", (paths,)) == 9
-    assert _initial_progress_total("alignment", (paths,)) == 7
+    assert _initial_progress_total("calibration", (paths,)) == 3
+    assert _initial_progress_total("alignment", (paths,)) == 3
     assert _initial_progress_total("tracking", (paths,)) is None
 
 

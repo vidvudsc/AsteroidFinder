@@ -39,7 +39,7 @@ def align_images(
     if not paths:
         raise ValueError("No images provided")
 
-    total = max(1, len(paths) * 2 + 1)
+    total = max(1, len(paths))
     loaded = [load_image(path) for path in paths]
     if progress_callback is not None:
         progress_callback(1, total, "Loaded reference frame")
@@ -74,11 +74,10 @@ def align_images(
     out_dir = Path(output_dir) if output_dir is not None else None
     if out_dir is not None:
         out_dir.mkdir(parents=True, exist_ok=True)
+        if progress_callback is not None:
+            progress_callback(total, total, "Writing aligned FITS files")
         for frame in result:
             save_fits(frame.data, out_dir / f"{frame.image.path.stem}_aligned.fits", frame.image.header)
-            done += 1
-            if progress_callback is not None:
-                progress_callback(done, total, f"Wrote {frame.image.path.name}")
     return result
 
 

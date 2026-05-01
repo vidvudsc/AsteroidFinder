@@ -439,7 +439,14 @@ class MainWindow(QMainWindow):
         if not paths:
             return
         crop_overlap = bool(self.alignment_output.currentData())
-        self._start_worker("alignment", align_images, paths, output_dir=self._output_dir() / "aligned", crop_overlap=crop_overlap)
+        self._start_worker(
+            "alignment",
+            align_images,
+            paths,
+            output_dir=self._output_dir() / "aligned",
+            crop_overlap=crop_overlap,
+            prefer_translation=False,
+        )
 
     def run_tracking(self) -> None:
         paths = self._require_paths(prefer_aligned=True, require_same_shape=True)
@@ -623,6 +630,12 @@ class MainWindow(QMainWindow):
             aligned_dir = self._output_dir() / "aligned"
             mode = self.alignment_output.currentText()
             self._log(f"Aligned FITS written to {aligned_dir} ({mode})")
+            aligned_paths = [aligned_dir / f"{frame.image.path.stem}_aligned.fits" for frame in result] if isinstance(result, list) else []
+            existing = [path for path in aligned_paths if path.exists()]
+            if existing:
+                self.session.frames = [self._frame_info(path) for path in existing]
+                self._populate_frames()
+                self._show_frame(0, keep_view=False)
         elif name == "plate solve":
             self._log(f"Solved FITS written to {self._output_dir() / 'solved'}")
             solved_paths = [Path(path) for path in result] if isinstance(result, list) else []
@@ -1173,9 +1186,9 @@ def _initial_progress_total(name: str, args: tuple[Any, ...]) -> int | None:
     if name == "plate solve":
         return count
     if name == "calibration":
-        return count * 3
+        return count
     if name == "alignment":
-        return count * 2 + 1
+        return count
     return None
 
 

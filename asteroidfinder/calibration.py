@@ -110,7 +110,7 @@ def calibrate_images_with_persistent_hot_pixels(
     """
 
     all_paths = list(paths)
-    total = max(1, len(all_paths) * 3)
+    total = max(1, len(all_paths))
     done = 0
     grouped_paths = _group_paths_by_shape(all_paths)
     results = []
@@ -124,22 +124,20 @@ def calibrate_images_with_persistent_hot_pixels(
             progress_callback=(
                 None
                 if progress_callback is None
-                else lambda step, steps, text: progress_callback(done + step, total, text)
+                else lambda step, steps, text: progress_callback(min(done + step, total), total, text)
             ),
         )
         done += len(shape_paths)
         results.extend(calibrate_image(path, hot_pixel_mask=mask, hot_sigma=hot_sigma, **kwargs) for path in shape_paths)
-        done += len(shape_paths)
         if progress_callback is not None:
-            progress_callback(done, total, "Applied hot-pixel mask")
+            progress_callback(min(done, total), total, "Applied hot-pixel mask")
     if output_dir is not None:
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
+        if progress_callback is not None:
+            progress_callback(total, total, "Writing calibrated FITS files")
         for result in results:
             save_fits(result.data, out_dir / f"{result.image.path.stem}_calibrated.fits", result.image.header)
-            done += 1
-            if progress_callback is not None:
-                progress_callback(done, total, f"Wrote {result.image.path.name}")
     elif progress_callback is not None:
         progress_callback(total, total, "Hot-pixel cleaning complete")
     return results
