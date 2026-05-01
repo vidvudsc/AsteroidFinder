@@ -87,10 +87,9 @@ Then launch the early dark-themed desktop app:
 asteroidfinder-desktop
 ```
 
-The desktop app can import selected FITS images, preview and blink frames,
-invert the view, run calibration, plate solving, alignment, tracking,
-known-object lookup, target tracking, one-click reports, PNG diagnostics, and
-measured-track MPC exports through the same library pipeline.
+The desktop app is focused on the reduction path: import FITS images, inspect
+and blink frames, clean hot pixels, plate solve, align stars, detect moving
+objects, identify known matches, and export measured-track data for MPC review.
 
 ![AsteroidFinder desktop main view](docs/main.png)
 
@@ -100,16 +99,14 @@ Current desktop inspection features:
 
 - cached FITS preview and blink playback
 - WCS status and frame metadata table
+- compact workflow panel for cleaning, solving, alignment, detection,
+  identification, report generation, and MPC export
+- detected-track table with known/unknown match status
 - selected-track overlay with a single toggle for current-frame circle or full
   motion path
 - embedded Matplotlib movement chart with pan/zoom toolbar
 - per-detection measurement table with pixel, SNR, flux, residual, and WCS
   coordinates when available
-- target tracking mode: enter an asteroid name/designation, query solved frames,
-  overlay predicted positions, and export forced target photometry/offsets
-- known-object match table comparing expected speed/PA against measured tracks
-- processing queue table with running/done/failed status, cancel, and retry for
-  the last failed step
 - report window for output CSVs and generated HTML report
 
 ## Python API
