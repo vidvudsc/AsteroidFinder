@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+import csv
 import webbrowser
 
 from astropy.wcs import WCS
-from PySide6.QtCore import QThreadPool, QTimer, Qt, QUrl
+from PySide6.QtCore import QThreadPool, QTimer, Qt
 from PySide6.QtGui import QAction, QPalette, QColor, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -28,10 +30,10 @@ from PySide6.QtWidgets import (
     QSlider,
     QSpinBox,
     QSplitter,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
-    QTextBrowser,
     QToolBar,
     QVBoxLayout,
     QWidget,
@@ -68,13 +70,15 @@ class MainWindow(QMainWindow):
         self.diagnostic_paths: list[Path] = []
         self.known_objects: list[KnownObject] = []
         self.track_known_matches: dict[int, str] = {}
+        self._pending_open_graph = False
+        self._updating_track_table = False
         self._current_frame_index = 0
         self._blink_timer = QTimer(self)
         self._blink_timer.timeout.connect(self._advance_blink)
 
         self.viewer = FitsViewer()
         self.frame_table = QTableWidget(0, 5)
-        self.track_table = QTableWidget(0, 8)
+        self.track_table = QTableWidget(0, 9)
         self.log = QTextEdit()
         self.log.setReadOnly(True)
         self.progress_bar = QProgressBar()
@@ -277,22 +281,17 @@ class MainWindow(QMainWindow):
         plate_layout.addRow("File", self.plate_path)
         layout.addWidget(plate_box)
 
-        self.track_table.setHorizontalHeaderLabels(["ID", "Known", "Hits", "Vx", "Vy", "Sky speed", "PA", "Score"])
+        self.track_table.setHorizontalHeaderLabels(["Show", "ID", "Known", "Hits", "Vx", "Vy", "Sky speed", "PA", "Score"])
         self.track_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.track_table.itemSelectionChanged.connect(self._selected_track_changed)
+        self.track_table.itemChanged.connect(self._track_item_changed)
         layout.addWidget(QLabel("Detected Tracks"))
         layout.addWidget(self.track_overlay_mode)
         layout.addWidget(self.track_table, 1)
         graph_row = QHBoxLayout()
-        graph_button = QPushButton("Generate Movement Graphs")
-        graph_button.clicked.connect(self.generate_movement_graphs)
-        open_graph_button = QPushButton("Open Track Graph")
-        open_graph_button.clicked.connect(self.open_selected_movement_graph)
-        open_all_graphs_button = QPushButton("Open All")
-        open_all_graphs_button.clicked.connect(self.open_all_movement_graphs)
+        graph_button = QPushButton("Open Movement Graph")
+        graph_button.clicked.connect(self.open_or_generate_movement_graph)
         graph_row.addWidget(graph_button)
-        graph_row.addWidget(open_graph_button)
-        graph_row.addWidget(open_all_graphs_button)
         layout.addLayout(graph_row)
 
         layout.addWidget(QLabel("Log"))
@@ -398,6 +397,13 @@ class MainWindow(QMainWindow):
             self._error("No tracks", "Run tracking before generating movement graphs.")
             return
         self._start_worker("movement graphs", plot_track_diagnostics, self.tracks, self._output_dir() / "diagnostics")
+
+    def open_or_generate_movement_graph(self) -> None:
+        if self.diagnostic_paths:
+            self.open_selected_movement_graph()
+            return
+        self._pending_open_graph = True
+        self.generate_movement_graphs()
 
     def query_known_objects(self) -> None:
         paths = self._require_paths(prefer_solved=True)
@@ -528,6 +534,9 @@ class MainWindow(QMainWindow):
         elif name == "movement graphs":
             self.diagnostic_paths = [Path(path) for path in result] if isinstance(result, list) else []
             self._log(f"Movement graphs written to {self._output_dir() / 'diagnostics'}")
+            if self._pending_open_graph:
+                self._pending_open_graph = False
+                self.open_selected_movement_graph()
         elif name == "known objects":
             self.known_objects = list(result)  # type: ignore[arg-type]
             self._match_known_objects_to_tracks()
@@ -555,8 +564,13 @@ class MainWindow(QMainWindow):
                 self.frame_table.setItem(row, column, QTableWidgetItem(value))
 
     def _populate_tracks(self) -> None:
+        self._updating_track_table = True
         self.track_table.setRowCount(len(self.tracks))
         for row, track in enumerate(self.tracks):
+            show_item = QTableWidgetItem()
+            show_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+            show_item.setCheckState(Qt.CheckState.Checked if row == 0 else Qt.CheckState.Unchecked)
+            self.track_table.setItem(row, 0, show_item)
             values = [
                 str(row + 1),
                 self.track_known_matches.get(row, ""),
@@ -568,10 +582,17 @@ class MainWindow(QMainWindow):
                 f"{track.score:.3f}",
             ]
             for column, value in enumerate(values):
-                self.track_table.setItem(row, column, QTableWidgetItem(value))
+                self.track_table.setItem(row, column + 1, QTableWidgetItem(value))
+        self._updating_track_table = False
         self._log(f"Tracking found {len(self.tracks)} candidate tracks")
         if self.tracks:
             self.track_table.selectRow(0)
+            self._draw_checked_tracks()
+
+    def _track_item_changed(self, item: QTableWidgetItem) -> None:
+        if self._updating_track_table or item.column() != 0:
+            return
+        self._draw_checked_tracks()
 
     def _selected_frame_changed(self) -> None:
         rows = self.frame_table.selectionModel().selectedRows()
@@ -585,25 +606,49 @@ class MainWindow(QMainWindow):
         index = rows[0].row()
         if index >= len(self.tracks):
             return
-        self._draw_selected_track()
+        if not self._checked_track_indices():
+            self._draw_selected_track()
 
     def _draw_selected_track(self) -> None:
         index = self._selected_track_index()
         if index is None:
             return
-        track = self.tracks[index]
-        points = [(det.source.x, det.source.y) for det in track.detections]
-        current_detection_index = next(
-            (det_index for det_index, det in enumerate(track.detections) if det.frame_index == self._current_frame_index),
-            None,
-        )
+        self._draw_track_indices([index])
+
+    def _draw_checked_tracks(self) -> None:
+        indices = self._checked_track_indices()
         self.viewer.clear_overlays()
-        self.viewer.show_track_overlay(
-            points,
-            f"AF{index + 1:04d}",
-            mode=str(self.track_overlay_mode.currentData()),
-            current_index=current_detection_index,
-        )
+        if indices:
+            self._draw_track_indices(indices, clear_first=False)
+
+    def _draw_track_indices(self, indices: list[int], *, clear_first: bool = True) -> None:
+        if clear_first:
+            self.viewer.clear_overlays()
+        colors = ["#38bdf8", "#fbbf24", "#a78bfa", "#34d399", "#fb7185", "#f97316"]
+        for index in indices:
+            if index >= len(self.tracks):
+                continue
+            track = self.tracks[index]
+            points = [(det.source.x, det.source.y) for det in track.detections]
+            current_detection_index = next(
+                (det_index for det_index, det in enumerate(track.detections) if det.frame_index == self._current_frame_index),
+                None,
+            )
+            self.viewer.show_track_overlay(
+                points,
+                f"AF{index + 1:04d}",
+                mode=str(self.track_overlay_mode.currentData()),
+                current_index=current_detection_index,
+                color=colors[index % len(colors)],
+            )
+
+    def _checked_track_indices(self) -> list[int]:
+        indices = []
+        for row in range(self.track_table.rowCount()):
+            item = self.track_table.item(row, 0)
+            if item is not None and item.checkState() == Qt.CheckState.Checked:
+                indices.append(row)
+        return indices
 
     def open_selected_movement_graph(self) -> None:
         index = self._selected_track_index()
@@ -677,7 +722,7 @@ class MainWindow(QMainWindow):
         self.viewer.load_path(frame.path, keep_view=keep_view)
         self.frame_table.selectRow(self._current_frame_index)
         self._update_plate_info(Path(frame.path))
-        self._draw_selected_track()
+        self._draw_checked_tracks()
 
     def _step_frame(self, delta: int) -> None:
         if self.session.frames:
@@ -972,29 +1017,61 @@ def _pixel_scale_arcsec(wcs: WCS) -> float | None:
 class DiagnosticWindow(QDialog):
     def __init__(self, paths: list[Path], title: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.paths = paths
+        self.index = 0
+        self.zoom = 100
         self.setWindowTitle(title)
         self.resize(980, 760)
         layout = QVBoxLayout(self)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        content = QWidget()
-        content_layout = QVBoxLayout(content)
-        for path in paths:
-            label = QLabel()
-            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            pixmap = QPixmap(str(path))
-            if pixmap.isNull():
-                label.setText(f"Could not load {path.name}")
-            else:
-                label.setPixmap(pixmap.scaledToWidth(900, Qt.TransformationMode.SmoothTransformation))
-            caption = QLabel(path.name)
-            caption.setObjectName("MutedText")
-            caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            content_layout.addWidget(label)
-            content_layout.addWidget(caption)
-        content_layout.addStretch(1)
-        scroll.setWidget(content)
-        layout.addWidget(scroll)
+
+        controls = QHBoxLayout()
+        previous = QPushButton("Previous")
+        previous.clicked.connect(lambda: self._step(-1))
+        next_button = QPushButton("Next")
+        next_button.clicked.connect(lambda: self._step(1))
+        self.caption = QLabel()
+        self.caption.setObjectName("MutedText")
+        self.zoom_slider = QSlider(Qt.Orientation.Horizontal)
+        self.zoom_slider.setRange(35, 180)
+        self.zoom_slider.setValue(self.zoom)
+        self.zoom_slider.valueChanged.connect(self._set_zoom)
+        controls.addWidget(previous)
+        controls.addWidget(next_button)
+        controls.addWidget(self.caption, 1)
+        controls.addWidget(QLabel("Zoom"))
+        controls.addWidget(self.zoom_slider)
+        layout.addLayout(controls)
+
+        self.image_label = QLabel()
+        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setWidget(self.image_label)
+        layout.addWidget(self.scroll, 1)
+        self._render()
+
+    def _step(self, delta: int) -> None:
+        if not self.paths:
+            return
+        self.index = (self.index + delta) % len(self.paths)
+        self._render()
+
+    def _set_zoom(self, value: int) -> None:
+        self.zoom = value
+        self._render()
+
+    def _render(self) -> None:
+        if not self.paths:
+            self.image_label.setText("No graphs")
+            return
+        path = self.paths[self.index]
+        pixmap = QPixmap(str(path))
+        self.caption.setText(f"{self.index + 1} / {len(self.paths)}  {path.name}")
+        if pixmap.isNull():
+            self.image_label.setText(f"Could not load {path.name}")
+            return
+        width = max(240, int(pixmap.width() * self.zoom / 100))
+        self.image_label.setPixmap(pixmap.scaledToWidth(width, Qt.TransformationMode.SmoothTransformation))
 
 
 class ReportWindow(QDialog):
@@ -1007,11 +1084,75 @@ class ReportWindow(QDialog):
         controls = QHBoxLayout()
         open_browser = QPushButton("Open In Browser")
         open_browser.clicked.connect(lambda: webbrowser.open(self.path.resolve().as_uri()))
+        refresh = QPushButton("Refresh")
+        refresh.clicked.connect(self._load_report)
         controls.addWidget(QLabel(str(path)))
         controls.addStretch(1)
+        controls.addWidget(refresh)
         controls.addWidget(open_browser)
         layout.addLayout(controls)
-        browser = QTextBrowser()
-        browser.setOpenExternalLinks(True)
-        browser.setSource(QUrl.fromLocalFile(str(path.resolve())))
-        layout.addWidget(browser, 1)
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs, 1)
+        self._load_report()
+
+    def _load_report(self) -> None:
+        self.tabs.clear()
+        out_dir = self.path.parent
+        self.tabs.addTab(self._summary_tab(out_dir), "Summary")
+        for title, filename in [
+            ("Tracks", "tracks.csv"),
+            ("Known Objects", "known_objects.csv"),
+            ("Alignment", "alignment_report.csv"),
+            ("Hot Pixels", "hot_pixel_report.csv"),
+            ("Forced Photometry", "known_object_forced_photometry.csv"),
+        ]:
+            rows = _read_csv_file(out_dir / filename)
+            if rows:
+                self.tabs.addTab(_table_widget(rows), title)
+        self.tabs.addTab(self._files_tab(out_dir), "Files")
+
+    def _summary_tab(self, out_dir: Path) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        metrics = [
+            ("Output folder", str(out_dir)),
+            ("Tracks", str(len(_read_csv_file(out_dir / "tracks.csv")))),
+            ("Known objects", str(len(_read_csv_file(out_dir / "known_objects.csv")))),
+            ("Alignment rows", str(len(_read_csv_file(out_dir / "alignment_report.csv")))),
+            ("Movement graphs", str(len(list((out_dir / "diagnostics").glob("*.png"))) if (out_dir / "diagnostics").exists() else 0)),
+        ]
+        for label, value in metrics:
+            row = QLabel(f"<b>{label}</b>: {value}")
+            row.setTextFormat(Qt.TextFormat.RichText)
+            layout.addWidget(row)
+        layout.addStretch(1)
+        return widget
+
+    def _files_tab(self, out_dir: Path) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        files = QListWidget()
+        for path in sorted(out_dir.rglob("*")):
+            if path.is_file():
+                files.addItem(str(path.relative_to(out_dir)))
+        layout.addWidget(files, 1)
+        return widget
+
+
+def _read_csv_file(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    with path.open(newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _table_widget(rows: list[dict[str, str]]) -> QTableWidget:
+    headers = list(rows[0].keys()) if rows else []
+    table = QTableWidget(len(rows), len(headers))
+    table.setHorizontalHeaderLabels(headers)
+    table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+    table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+    for row_index, row in enumerate(rows):
+        for col_index, header in enumerate(headers):
+            table.setItem(row_index, col_index, QTableWidgetItem(row.get(header, "")))
+    return table

@@ -58,9 +58,9 @@ def query_known_objects_in_frame(
     image = load_image(path)
     if image.header is None:
         raise ValueError(f"No FITS header available for known-object query: {path}")
-    date_obs = image.header.get("DATE-OBS")
-    if not date_obs:
-        raise ValueError(f"DATE-OBS is required for known-object query: {path}")
+    observation_time = _observation_time(image.header)
+    if observation_time is None:
+        raise ValueError(f"Observation time is required for known-object query: {path}")
 
     wcs = WCS(image.header)
     if not wcs.has_celestial:
@@ -68,7 +68,7 @@ def query_known_objects_in_frame(
 
     height, width = image.data.shape
     center, radius = _frame_center_radius(wcs, width, height)
-    table = Skybot.cone_search(center, radius, Time(date_obs), location=location)
+    table = Skybot.cone_search(center, radius, observation_time, location=location)
 
     objects: list[KnownObject] = []
     for row in table:
@@ -80,7 +80,7 @@ def query_known_objects_in_frame(
         objects.append(
             KnownObject(
                 frame=Path(path),
-                date_obs=str(date_obs),
+                date_obs=observation_time.isot,
                 number=_str(row["Number"]),
                 name=_str(row["Name"]),
                 object_type=_str(row["Type"]),
@@ -241,6 +241,31 @@ def _frame_center_radius(wcs: WCS, width: int, height: int) -> tuple[SkyCoord, u
     corners = wcs.pixel_to_world([0, width - 1, width - 1, 0], [0, 0, height - 1, height - 1])
     radius = max(center.separation(corners)).to(u.deg)
     return center, radius
+
+
+def _observation_time(header: fits.Header) -> Time | None:
+    for key in ("DATE-OBS", "DATEOBS", "DATE"):
+        value = header.get(key)
+        if value:
+            try:
+                return Time(value)
+            except Exception:
+                pass
+    for key in ("OBSJD", "JD", "JULDATE"):
+        value = header.get(key)
+        if value not in {None, ""}:
+            try:
+                return Time(float(value), format="jd")
+            except Exception:
+                pass
+    for key in ("MJD-OBS", "MJD"):
+        value = header.get(key)
+        if value not in {None, ""}:
+            try:
+                return Time(float(value), format="mjd")
+            except Exception:
+                pass
+    return None
 
 
 def _float(value: object) -> float:

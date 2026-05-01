@@ -199,6 +199,16 @@ def test_doctor_reports_index_recommendation(tmp_path: Path) -> None:
     assert series == ["4210", "4211", "4212"]
 
 
+def test_known_object_time_fallback_accepts_obsjd() -> None:
+    from astropy.io import fits
+    from asteroidfinder.known_objects import _observation_time
+
+    header = fits.Header()
+    header["OBSJD"] = 2460675.5
+
+    assert _observation_time(header).isot.startswith("2024-")
+
+
 def _synthetic_wcs_sequence(tmp_path: Path) -> list[Path]:
     paths = []
     yy, xx = np.indices((120, 120))
