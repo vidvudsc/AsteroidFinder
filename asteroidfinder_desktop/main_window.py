@@ -7,7 +7,7 @@ import webbrowser
 
 from astropy.wcs import WCS
 from PySide6.QtCore import QPointF, QRectF, QSize, QThreadPool, QTimer, Qt
-from PySide6.QtGui import QAction, QBrush, QColor, QFont, QPainter, QPalette, QPen
+from PySide6.QtGui import QAction, QBrush, QColor, QFont, QMouseEvent, QPainter, QPalette, QPen, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -112,12 +112,9 @@ class MainWindow(QMainWindow):
         self.alignment_output.addItem("Crop clean overlap", True)
         self.alignment_output.addItem("Keep reference canvas", False)
         self.alignment_output.setToolTip("Crop removes black no-data borders after alignment. Keep reference canvas is better for debugging.")
-        self.track_overlay_mode = QComboBox()
-        self.track_overlay_mode.addItem("Circle on current frame", "circle")
-        self.track_overlay_mode.addItem("Motion path", "path")
-        self.track_overlay_mode.addItem("Circle + path", "both")
-        self.track_overlay_mode.setToolTip("Circle marks the selected track on the current frame. Path shows the full fitted motion trail.")
-        self.track_overlay_mode.currentIndexChanged.connect(lambda _: self._draw_selected_track())
+        self.show_full_track = QCheckBox("Show full track")
+        self.show_full_track.setToolTip("Off shows one circle on the current frame. On shows every detection and the motion line.")
+        self.show_full_track.toggled.connect(lambda _: self._draw_checked_tracks())
         self.invert_check = QCheckBox("Invert")
         self.blink_slider = QSlider(Qt.Orientation.Horizontal)
         self.blink_slider.setRange(1, 20)
@@ -286,7 +283,7 @@ class MainWindow(QMainWindow):
         self.track_table.itemSelectionChanged.connect(self._selected_track_changed)
         self.track_table.itemChanged.connect(self._track_item_changed)
         layout.addWidget(QLabel("Detected Tracks"))
-        layout.addWidget(self.track_overlay_mode)
+        layout.addWidget(self.show_full_track)
         layout.addWidget(self.track_table, 1)
         graph_row = QHBoxLayout()
         graph_button = QPushButton("Open Movement Chart")
@@ -618,7 +615,7 @@ class MainWindow(QMainWindow):
         indices = self._checked_track_indices()
         self.viewer.clear_overlays()
         if indices:
-            self._draw_track_indices(indices, clear_first=False, mode="path")
+            self._draw_track_indices(indices, clear_first=False)
 
     def _draw_track_indices(self, indices: list[int], *, clear_first: bool = True, mode: str | None = None) -> None:
         if clear_first:
@@ -636,7 +633,7 @@ class MainWindow(QMainWindow):
             self.viewer.show_track_overlay(
                 points,
                 f"AF{index + 1:04d}",
-                mode=mode or str(self.track_overlay_mode.currentData()),
+                mode=mode or ("path" if self.show_full_track.isChecked() else "circle"),
                 current_index=current_detection_index,
                 color=colors[index % len(colors)],
             )
@@ -1103,7 +1100,12 @@ class TrackChartWidget(QWidget):
         self.known_name = ""
         self.frame_size: tuple[int, int] | None = None
         self.selected_offset: int | None = None
+        self.on_selected_offset: Any | None = None
+        self.on_zoom_changed: Any | None = None
+        self._hit_points: list[tuple[QPointF, int]] = []
         self.zoom = 100
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMinimumSize(self.sizeHint())
 
     def set_track(
@@ -1122,7 +1124,7 @@ class TrackChartWidget(QWidget):
         self.update()
 
     def set_zoom(self, zoom: int) -> None:
-        self.zoom = zoom
+        self.zoom = max(45, min(300, zoom))
         self.setMinimumSize(self.sizeHint())
         self.updateGeometry()
         self.update()
@@ -1148,6 +1150,7 @@ class TrackChartWidget(QWidget):
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Track has no detections")
             return
 
+        self._hit_points = []
         margin = 28
         header_h = 82
         gap = 18
@@ -1255,6 +1258,7 @@ class TrackChartWidget(QWidget):
                 painter.drawLine(QPointF(point.x(), point.y() - 14), QPointF(point.x(), point.y() + 14))
             painter.setPen(QColor("#dbe7f3"))
             painter.drawText(QPointF(point.x() + 8, point.y() - 8), f"F{int(frame)}")
+            self._hit_points.append((point, idx))
 
         self._draw_axis_labels(painter, plot, f"x {min_x:.1f}..{max_x:.1f}", f"y {min_y:.1f}..{max_y:.1f}")
 
@@ -1308,6 +1312,28 @@ class TrackChartWidget(QWidget):
         painter.drawText(QPointF(plot.left(), plot.bottom() + 22), x_text)
         painter.drawText(QPointF(plot.left() - 4, plot.top() - 10), y_text)
 
+    def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+        factor = 1.12 if delta > 0 else 1 / 1.12
+        self.set_zoom(int(self.zoom * factor))
+        if self.on_zoom_changed is not None:
+            self.on_zoom_changed(self.zoom)
+        event.accept()
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if not self._hit_points:
+            return
+        pos = event.position()
+        best_point, best_offset = min(
+            self._hit_points,
+            key=lambda item: (item[0].x() - pos.x()) ** 2 + (item[0].y() - pos.y()) ** 2,
+        )
+        distance_sq = (best_point.x() - pos.x()) ** 2 + (best_point.y() - pos.y()) ** 2
+        if distance_sq <= 18**2 and best_offset != self.selected_offset and self.on_selected_offset is not None:
+            self.on_selected_offset(best_offset)
+
 
 class DiagnosticWindow(QDialog):
     def __init__(
@@ -1343,24 +1369,17 @@ class DiagnosticWindow(QDialog):
         show_button.clicked.connect(self._show_on_image)
         copy_button = QPushButton("Copy Summary")
         copy_button.clicked.connect(self._copy_summary)
-        reset_zoom = QPushButton("100%")
-        reset_zoom.clicked.connect(lambda: self.zoom_slider.setValue(100))
         self.caption = QLabel()
         self.caption.setObjectName("MutedText")
-        self.zoom_slider = QSlider(Qt.Orientation.Horizontal)
-        self.zoom_slider.setRange(45, 300)
-        self.zoom_slider.setValue(self.zoom)
-        self.zoom_slider.setTickInterval(25)
-        self.zoom_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-        self.zoom_slider.valueChanged.connect(self._set_zoom)
+        reset_zoom = QPushButton("Reset Zoom")
+        reset_zoom.clicked.connect(lambda: self._set_zoom(100))
         controls.addWidget(previous)
         controls.addWidget(next_button)
         controls.addWidget(show_button)
         controls.addWidget(copy_button)
         controls.addWidget(self.caption, 1)
         controls.addWidget(reset_zoom)
-        controls.addWidget(QLabel("Zoom"))
-        controls.addWidget(self.zoom_slider)
+        controls.addWidget(QLabel("Mouse wheel zoom"))
         layout.addLayout(controls)
 
         scrub = QHBoxLayout()
@@ -1380,6 +1399,8 @@ class DiagnosticWindow(QDialog):
         layout.addLayout(scrub)
 
         self.chart = TrackChartWidget()
+        self.chart.on_selected_offset = self._chart_selected_offset
+        self.chart.on_zoom_changed = self._chart_zoom_changed
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(False)
         self.scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1427,6 +1448,14 @@ class DiagnosticWindow(QDialog):
     def _set_zoom(self, value: int) -> None:
         self.zoom = value
         self._render_chart()
+
+    def _chart_selected_offset(self, value: int) -> None:
+        self.selected_offset = value
+        self._sync_detection_controls()
+        self._render_chart()
+
+    def _chart_zoom_changed(self, value: int) -> None:
+        self.zoom = value
 
     def _render(self) -> None:
         if not self.tracks:
