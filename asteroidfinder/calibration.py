@@ -103,10 +103,11 @@ def calibrate_images_with_persistent_hot_pixels(
     progress_callback: Callable[[int, int, str], None] | None = None,
     **kwargs: object,
 ) -> list[CalibrationResult]:
-    """Calibrate images using one conservative persistent hot-pixel map.
+    """Calibrate images using one conservative persistent bad-pixel map.
 
     This is safer for star fields than single-frame hot-pixel detection: a pixel
-    must be both isolated and repeatedly hot at the same sensor coordinate.
+    must be repeatedly bad at the same sensor coordinate. It catches isolated
+    hot pixels, cold/dead pixels, and tiny persistent bad-pixel clusters.
     """
 
     all_paths = list(paths)
@@ -153,7 +154,7 @@ def build_persistent_hot_pixel_mask(
     filter_size: int = 3,
     progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> np.ndarray:
-    """Build a fixed sensor-coordinate hot-pixel mask from a sequence."""
+    """Build a fixed sensor-coordinate bad-pixel mask from a sequence."""
 
     if not paths:
         raise ValueError("No images provided")
@@ -170,7 +171,7 @@ def build_persistent_hot_pixel_mask(
                 f"Expected {shape}, got {image.shape} for {path}."
             )
         detections.append(
-            detect_isolated_hot_pixels(
+            detect_bad_pixels(
                 image,
                 sigma=sigma,
                 neighbor_sigma=neighbor_sigma,
@@ -183,6 +184,41 @@ def build_persistent_hot_pixel_mask(
     counts = np.sum(np.stack(detections), axis=0)
     required = min_frames if min_frames is not None else max(2, int(np.ceil(len(detections) * 0.8)))
     return counts >= required
+
+
+def detect_bad_pixels(
+    data: np.ndarray,
+    *,
+    sigma: float = 25.0,
+    neighbor_sigma: float = 6.0,
+    min_center_neighbor_ratio: float = 2.0,
+    filter_size: int = 3,
+) -> np.ndarray:
+    """Detect bad-pixel candidates without replacing them.
+
+    This combines the original isolated-hot-pixel test with a symmetric
+    positive/negative residual test so persistent dead pixels and tiny bad
+    clusters are also removed.
+    """
+
+    image = np.asarray(data, dtype=np.float32)
+    local = median_filter(image, size=filter_size)
+    residual = image - local
+    robust_sigma = _robust_sigma(residual)
+    if robust_sigma <= 0 or not np.isfinite(robust_sigma):
+        return np.zeros(image.shape, dtype=bool)
+    isolated_hot = _isolated_hot_pixel_mask(
+        image,
+        local,
+        residual,
+        robust_sigma,
+        sigma=sigma,
+        neighbor_sigma=neighbor_sigma,
+        min_center_neighbor_ratio=min_center_neighbor_ratio,
+    )
+    signed_outlier = np.abs(residual) > sigma * robust_sigma
+    compact_outlier = _compact_outlier_mask(residual, robust_sigma, sigma=sigma)
+    return isolated_hot | (signed_outlier & compact_outlier)
 
 
 def detect_isolated_hot_pixels(
@@ -201,6 +237,27 @@ def detect_isolated_hot_pixels(
     robust_sigma = _robust_sigma(residual)
     if robust_sigma <= 0 or not np.isfinite(robust_sigma):
         return np.zeros(image.shape, dtype=bool)
+    return _isolated_hot_pixel_mask(
+        image,
+        local,
+        residual,
+        robust_sigma,
+        sigma=sigma,
+        neighbor_sigma=neighbor_sigma,
+        min_center_neighbor_ratio=min_center_neighbor_ratio,
+    )
+
+
+def _isolated_hot_pixel_mask(
+    image: np.ndarray,
+    local: np.ndarray,
+    residual: np.ndarray,
+    robust_sigma: float,
+    *,
+    sigma: float,
+    neighbor_sigma: float,
+    min_center_neighbor_ratio: float,
+) -> np.ndarray:
 
     footprint = np.ones((3, 3), dtype=bool)
     footprint[1, 1] = False
@@ -210,6 +267,24 @@ def detect_isolated_hot_pixels(
     quiet_neighbors = neighbor_residual < neighbor_sigma * robust_sigma
     isolated_contrast = image / np.maximum(neighbor_max, 1.0) >= min_center_neighbor_ratio
     return bright_center & quiet_neighbors & isolated_contrast
+
+
+def _compact_outlier_mask(residual: np.ndarray, robust_sigma: float, *, sigma: float) -> np.ndarray:
+    threshold = sigma * robust_sigma
+    strong = np.abs(residual) > threshold
+    padded = np.pad(strong, 1, mode="edge")
+    ys, xs = np.nonzero(strong)
+    if ys.size == 0:
+        return strong
+    neighbor_counts = np.zeros(ys.size, dtype=np.int16)
+    for dy in range(3):
+        for dx in range(3):
+            if dy == 1 and dx == 1:
+                continue
+            neighbor_counts += padded[ys + dy, xs + dx]
+    compact = np.zeros(strong.shape, dtype=bool)
+    compact[ys, xs] = neighbor_counts <= 2
+    return compact
 
 
 def apply_hot_pixel_mask(data: np.ndarray, mask: np.ndarray, *, filter_size: int = 3) -> np.ndarray:
