@@ -31,6 +31,7 @@ def run_asteroid_workflow(
     sigma: float = 4.0,
     min_detections: int = 3,
     make_preview: bool = True,
+    crop_overlap: bool = False,
 ) -> AsteroidWorkflowResult:
     """Run calibration, alignment, stacking, differencing, and tracking."""
 
@@ -58,7 +59,7 @@ def run_asteroid_workflow(
     else:
         working_paths = [Path(path) for path in paths]
 
-    aligned_frames = align_images(working_paths, output_dir=aligned_dir)
+    aligned_frames = align_images(working_paths, output_dir=aligned_dir, crop_overlap=crop_overlap)
     stack = stack_images(aligned_frames, method="median")
     stack_path = out_dir / "stack_median.fits"
     save_fits(stack, stack_path)

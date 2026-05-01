@@ -4,11 +4,12 @@ from pathlib import Path
 from typing import Any
 
 from astropy.wcs import WCS
-from PySide6.QtCore import QSize, QThreadPool, QTimer, Qt
+from PySide6.QtCore import QThreadPool, QTimer, Qt
 from PySide6.QtGui import QAction, QPalette, QColor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -24,7 +25,6 @@ from PySide6.QtWidgets import (
     QSlider,
     QSpinBox,
     QSplitter,
-    QStyle,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -86,6 +86,10 @@ class MainWindow(QMainWindow):
         self.min_detections.setRange(2, 20)
         self.min_detections.setValue(self.session.settings.min_detections)
         self.observatory_code = QLineEdit(self.session.settings.observatory_code)
+        self.alignment_output = QComboBox()
+        self.alignment_output.addItem("Crop clean overlap", True)
+        self.alignment_output.addItem("Keep reference canvas", False)
+        self.alignment_output.setToolTip("Crop removes black no-data borders after alignment. Keep reference canvas is better for debugging.")
         self.invert_check = QCheckBox("Invert")
         self.blink_slider = QSlider(Qt.Orientation.Horizontal)
         self.blink_slider.setRange(1, 20)
@@ -99,6 +103,7 @@ class MainWindow(QMainWindow):
         open_action = QAction("Import Images", self)
         open_action.triggered.connect(self.import_images)
         self.addAction(open_action)
+        self._build_menus(open_action)
 
         toolbar = QToolBar("Main")
         toolbar.setMovable(False)
@@ -140,6 +145,7 @@ class MainWindow(QMainWindow):
         settings.addRow("Detect sigma", self.detect_sigma)
         settings.addRow("Min detections", self.min_detections)
         settings.addRow("Observatory", self.observatory_code)
+        settings.addRow("Alignment output", self.alignment_output)
         layout.addLayout(settings)
 
         for label, handler in [
@@ -165,13 +171,13 @@ class MainWindow(QMainWindow):
         controls = QHBoxLayout()
         import_button = QPushButton("Import Images")
         import_button.clicked.connect(self.import_images)
-        previous = _icon_button(self, QStyle.StandardPixmap.SP_MediaSkipBackward, "Previous frame")
+        previous = _icon_button("⏮", "Previous frame")
         previous.clicked.connect(lambda: self._step_frame(-1))
-        self.play_button = _icon_button(self, QStyle.StandardPixmap.SP_MediaPlay, "Start blink")
+        self.play_button = _icon_button("▶", "Start blink")
         self.play_button.clicked.connect(self.toggle_blink)
-        next_button = _icon_button(self, QStyle.StandardPixmap.SP_MediaSkipForward, "Next frame")
+        next_button = _icon_button("⏭", "Next frame")
         next_button.clicked.connect(lambda: self._step_frame(1))
-        fit_button = _icon_button(self, QStyle.StandardPixmap.SP_TitleBarNormalButton, "Fit image to view")
+        fit_button = _icon_button("⛶", "Fit image to view")
         fit_button.clicked.connect(self.viewer.fit_to_view)
         self.invert_check.toggled.connect(self.viewer.set_inverted)
         controls.addWidget(import_button)
@@ -190,6 +196,34 @@ class MainWindow(QMainWindow):
         progress_row.addWidget(self.progress_bar, 1)
         layout.addLayout(progress_row)
         return panel
+
+    def _build_menus(self, open_action: QAction) -> None:
+        file_menu = self.menuBar().addMenu("File")
+        file_menu.addAction(open_action)
+        file_menu.addAction("Choose Output Folder", self.choose_output_folder)
+        file_menu.addAction("Save Session", self.save_session_file)
+        file_menu.addSeparator()
+        file_menu.addAction("Quit", QApplication.instance().quit)
+
+        view_menu = self.menuBar().addMenu("View")
+        view_menu.addAction("Fit Image To View", self.viewer.fit_to_view)
+        invert_action = QAction("Invert Image", self)
+        invert_action.setCheckable(True)
+        invert_action.toggled.connect(self.invert_check.setChecked)
+        self.invert_check.toggled.connect(invert_action.setChecked)
+        view_menu.addAction(invert_action)
+
+        run_menu = self.menuBar().addMenu("Run")
+        run_menu.addAction("Calibrate Hot Pixels", self.run_calibration)
+        run_menu.addAction("Plate Solve", self.run_plate_solve)
+        run_menu.addAction("Align Frames", self.run_alignment)
+        run_menu.addAction("Track Moving Objects", self.run_tracking)
+        run_menu.addAction("Full Basic Run", self.run_full_workflow)
+        run_menu.addSeparator()
+        run_menu.addAction("Export MPC", self.export_mpc)
+
+        help_menu = self.menuBar().addMenu("Help")
+        help_menu.addAction("About AsteroidFinder", self._show_about)
 
     def _analysis_panel(self) -> QWidget:
         panel = QWidget()
@@ -306,7 +340,8 @@ class MainWindow(QMainWindow):
         paths = self._require_paths(prefer_solved=True)
         if not paths:
             return
-        self._start_worker("alignment", align_images, paths, output_dir=self._output_dir() / "aligned", crop_overlap=False)
+        crop_overlap = bool(self.alignment_output.currentData())
+        self._start_worker("alignment", align_images, paths, output_dir=self._output_dir() / "aligned", crop_overlap=crop_overlap)
 
     def run_tracking(self) -> None:
         paths = self._require_paths(prefer_aligned=True, require_same_shape=True)
@@ -326,6 +361,7 @@ class MainWindow(QMainWindow):
             hot_sigma=self.hot_sigma.value(),
             sigma=self.detect_sigma.value(),
             min_detections=self.min_detections.value(),
+            crop_overlap=bool(self.alignment_output.currentData()),
         )
 
     def export_mpc(self) -> None:
@@ -356,11 +392,11 @@ class MainWindow(QMainWindow):
     def toggle_blink(self) -> None:
         if self._blink_timer.isActive():
             self._blink_timer.stop()
-            self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+            self.play_button.setText("▶")
             self.play_button.setToolTip("Start blink")
         else:
             self._blink_timer.start(self._blink_interval_ms())
-            self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
+            self.play_button.setText("⏸")
             self.play_button.setToolTip("Pause blink")
 
     def _blink_interval_ms(self) -> int:
@@ -409,7 +445,8 @@ class MainWindow(QMainWindow):
             self._populate_tracks()
         elif name == "alignment":
             aligned_dir = self._output_dir() / "aligned"
-            self._log(f"Aligned FITS written to {aligned_dir}")
+            mode = self.alignment_output.currentText()
+            self._log(f"Aligned FITS written to {aligned_dir} ({mode})")
         elif name == "plate solve":
             self._log(f"Solved FITS written to {self._output_dir() / 'solved'}")
             solved_paths = [Path(path) for path in result] if isinstance(result, list) else []
@@ -582,6 +619,13 @@ class MainWindow(QMainWindow):
     def _error(self, title: str, detail: str) -> None:
         QMessageBox.critical(self, title, detail)
 
+    def _show_about(self) -> None:
+        QMessageBox.information(
+            self,
+            "About AsteroidFinder",
+            "AsteroidFinder desktop preview\n\nReal FITS loading, plate solving, alignment, tracking, and MPC export.",
+        )
+
     def _update_plate_info(self, path: Path) -> None:
         try:
             image = load_image(path)
@@ -649,6 +693,12 @@ def apply_dark_theme(app: QApplication) -> None:
         }
         QPushButton:pressed {
             background: #0e4f89;
+        }
+        QPushButton#IconButton {
+            color: #ffffff;
+            font-size: 16px;
+            font-weight: 700;
+            padding: 0;
         }
         QLineEdit, QSpinBox, QDoubleSpinBox, QTextEdit, QTableWidget {
             background: #070b11;
@@ -728,12 +778,11 @@ def _size_text(frame: FrameInfo) -> str:
     return f"{frame.width} x {frame.height}"
 
 
-def _icon_button(window: QWidget, icon: QStyle.StandardPixmap, tooltip: str) -> QPushButton:
-    button = QPushButton()
-    button.setIcon(window.style().standardIcon(icon))
-    button.setIconSize(QSize(18, 18))
+def _icon_button(text: str, tooltip: str) -> QPushButton:
+    button = QPushButton(text)
     button.setFixedSize(34, 30)
     button.setToolTip(tooltip)
+    button.setObjectName("IconButton")
     return button
 
 
