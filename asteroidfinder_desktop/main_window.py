@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QSlider,
     QSpinBox,
     QSplitter,
@@ -174,6 +175,8 @@ class MainWindow(QMainWindow):
 
         workflow_box = QGroupBox("Workflow")
         workflow_layout = QVBoxLayout(workflow_box)
+        workflow_layout.setContentsMargins(10, 10, 10, 10)
+        workflow_layout.setSpacing(5)
         for label, handler in [
             ("Clean Hot Pixels", self.run_calibration),
             ("Plate Solve", self.run_plate_solve),
@@ -184,7 +187,9 @@ class MainWindow(QMainWindow):
             ("Report", self.open_report_window),
         ]:
             button = QPushButton(label)
-            button.setMinimumHeight(28)
+            button.setObjectName("WorkflowButton")
+            button.setFixedHeight(30)
+            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             button.clicked.connect(handler)
             workflow_layout.addWidget(button)
         layout.addWidget(workflow_box)
@@ -975,6 +980,11 @@ def apply_dark_theme(app: QApplication) -> None:
         }
         QPushButton:pressed {
             background: #0e4f89;
+        }
+        QPushButton#WorkflowButton {
+            min-height: 30px;
+            max-height: 30px;
+            padding: 0 10px;
         }
         QPushButton#IconButton {
             color: #ffffff;
