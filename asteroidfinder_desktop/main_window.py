@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSlider,
     QSpinBox,
     QSplitter,
@@ -56,6 +58,7 @@ class MainWindow(QMainWindow):
         self.thread_pool.setMaxThreadCount(1)
         self.thread_pool.setStackSize(32 * 1024 * 1024)
         self._workers: list[FunctionWorker] = []
+        self._diagnostic_windows: list[QDialog] = []
         self.tracks: list[Track] = []
         self.diagnostic_paths: list[Path] = []
         self._current_frame_index = 0
@@ -100,10 +103,6 @@ class MainWindow(QMainWindow):
         self.track_overlay_mode.addItem("Circle + path", "both")
         self.track_overlay_mode.setToolTip("Circle marks the selected track on the current frame. Path shows the full fitted motion trail.")
         self.track_overlay_mode.currentIndexChanged.connect(lambda _: self._draw_selected_track())
-        self.diagnostic_preview = QLabel("No movement graph")
-        self.diagnostic_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.diagnostic_preview.setMinimumHeight(180)
-        self.diagnostic_preview.setObjectName("DiagnosticPreview")
         self.invert_check = QCheckBox("Invert")
         self.blink_slider = QSlider(Qt.Orientation.Horizontal)
         self.blink_slider.setRange(1, 20)
@@ -270,9 +269,14 @@ class MainWindow(QMainWindow):
         graph_row = QHBoxLayout()
         graph_button = QPushButton("Generate Movement Graphs")
         graph_button.clicked.connect(self.generate_movement_graphs)
+        open_graph_button = QPushButton("Open Track Graph")
+        open_graph_button.clicked.connect(self.open_selected_movement_graph)
+        open_all_graphs_button = QPushButton("Open All")
+        open_all_graphs_button.clicked.connect(self.open_all_movement_graphs)
         graph_row.addWidget(graph_button)
+        graph_row.addWidget(open_graph_button)
+        graph_row.addWidget(open_all_graphs_button)
         layout.addLayout(graph_row)
-        layout.addWidget(self.diagnostic_preview, 1)
 
         layout.addWidget(QLabel("Log"))
         layout.addWidget(self.log, 1)
@@ -489,7 +493,6 @@ class MainWindow(QMainWindow):
         elif name == "movement graphs":
             self.diagnostic_paths = [Path(path) for path in result] if isinstance(result, list) else []
             self._log(f"Movement graphs written to {self._output_dir() / 'diagnostics'}")
-            self._show_selected_diagnostic()
 
     def _forget_worker(self, worker: FunctionWorker) -> None:
         if worker in self._workers:
@@ -539,7 +542,6 @@ class MainWindow(QMainWindow):
         if index >= len(self.tracks):
             return
         self._draw_selected_track()
-        self._show_selected_diagnostic()
 
     def _draw_selected_track(self) -> None:
         index = self._selected_track_index()
@@ -559,25 +561,28 @@ class MainWindow(QMainWindow):
             current_index=current_detection_index,
         )
 
-    def _show_selected_diagnostic(self) -> None:
+    def open_selected_movement_graph(self) -> None:
         index = self._selected_track_index()
         if index is None or index >= len(self.diagnostic_paths):
-            self.diagnostic_preview.setText("No movement graph")
-            self.diagnostic_preview.setPixmap(QPixmap())
+            self._error("No graph", "Generate movement graphs, then select a detected track.")
             return
-        pixmap = QPixmap(str(self.diagnostic_paths[index]))
-        if pixmap.isNull():
-            self.diagnostic_preview.setText("Graph could not be loaded")
+        self._open_graph_window([self.diagnostic_paths[index]], f"Track {index + 1} Movement")
+
+    def open_all_movement_graphs(self) -> None:
+        if not self.diagnostic_paths:
+            self._error("No graphs", "Generate movement graphs after tracking.")
             return
-        self.diagnostic_preview.setText("")
-        self.diagnostic_preview.setPixmap(
-            pixmap.scaled(
-                self.diagnostic_preview.width(),
-                self.diagnostic_preview.height(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-        )
+        self._open_graph_window(self.diagnostic_paths, "All Movement Graphs")
+
+    def _open_graph_window(self, paths: list[Path], title: str) -> None:
+        window = DiagnosticWindow(paths, title, parent=self)
+        window.destroyed.connect(lambda *_: self._forget_diagnostic_window(window))
+        self._diagnostic_windows.append(window)
+        window.show()
+
+    def _forget_diagnostic_window(self, window: QDialog) -> None:
+        if window in self._diagnostic_windows:
+            self._diagnostic_windows.remove(window)
 
     def _selected_track_index(self) -> int | None:
         rows = self.track_table.selectionModel().selectedRows()
@@ -830,12 +835,6 @@ def apply_dark_theme(app: QApplication) -> None:
         QProgressBar::chunk {
             background: #2a8cdc;
         }
-        QLabel#DiagnosticPreview {
-            background: #070b11;
-            border: 1px solid #26364a;
-            border-radius: 4px;
-            color: #9fb2c5;
-        }
         #MutedText {
             color: #9fb2c5;
         }
@@ -890,3 +889,31 @@ def _pixel_scale_arcsec(wcs: WCS) -> float | None:
         return float(sum(abs(value) for value in scales) / len(scales))
     except Exception:
         return None
+
+
+class DiagnosticWindow(QDialog):
+    def __init__(self, paths: list[Path], title: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(980, 760)
+        layout = QVBoxLayout(self)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        for path in paths:
+            label = QLabel()
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            pixmap = QPixmap(str(path))
+            if pixmap.isNull():
+                label.setText(f"Could not load {path.name}")
+            else:
+                label.setPixmap(pixmap.scaledToWidth(900, Qt.TransformationMode.SmoothTransformation))
+            caption = QLabel(path.name)
+            caption.setObjectName("MutedText")
+            caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            content_layout.addWidget(label)
+            content_layout.addWidget(caption)
+        content_layout.addStretch(1)
+        scroll.setWidget(content)
+        layout.addWidget(scroll)
