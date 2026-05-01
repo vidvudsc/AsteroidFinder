@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Iterable
 import json
+import re
 
 
 FITS_EXTENSIONS = {".fit", ".fits", ".fts", ".new"}
@@ -50,11 +52,21 @@ def discover_fits_files(folder: str | Path) -> list[Path]:
     root = Path(folder).expanduser()
     if not root.exists():
         raise FileNotFoundError(root)
-    return sorted(path for path in root.iterdir() if path.is_file() and path.suffix.lower() in FITS_EXTENSIONS)
+    return natural_sorted(path for path in root.iterdir() if path.is_file() and path.suffix.lower() in FITS_EXTENSIONS)
 
 
 def filter_image_files(paths: list[str] | tuple[str, ...] | list[Path]) -> list[Path]:
     return [Path(path).expanduser() for path in paths if Path(path).suffix.lower() in IMAGE_EXTENSIONS]
+
+
+def natural_sort_key(path: str | Path) -> tuple[object, ...]:
+    name = Path(path).name.lower()
+    parts = re.split(r"(\d+)", name)
+    return tuple(int(part) if part.isdigit() else part for part in parts)
+
+
+def natural_sorted(paths: Iterable[str | Path]) -> list[Path]:
+    return sorted((Path(path) for path in paths), key=natural_sort_key)
 
 
 def save_session(state: SessionState, path: str | Path) -> Path:

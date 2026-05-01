@@ -10,6 +10,13 @@ from .io import save_fits, save_jpeg
 from .tracking import Track, track_moving_objects
 
 
+def _natural_sort_key(path: str | Path) -> tuple[object, ...]:
+    import re
+
+    name = Path(path).name.lower()
+    return tuple(int(part) if part.isdigit() else part for part in re.split(r"(\d+)", name))
+
+
 @dataclass(frozen=True)
 class AsteroidWorkflowResult:
     aligned_frames: list[AlignedFrame]
@@ -55,7 +62,7 @@ def run_asteroid_workflow(
             master_flat=master_flat,
             hot_sigma=hot_sigma,
         )
-        working_paths = sorted(calibrated_dir.glob("*_calibrated.fits"))
+        working_paths = sorted(calibrated_dir.glob("*_calibrated.fits"), key=_natural_sort_key)
     else:
         working_paths = [Path(path) for path in paths]
 
