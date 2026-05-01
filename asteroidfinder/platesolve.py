@@ -95,6 +95,12 @@ def _solve_with_astrometry_net(
     cmd.append(str(working_input))
     try:
         subprocess.run(cmd, check=True, timeout=timeout + 30, capture_output=True, text=True)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"astrometry.net solve-field timed out after {timeout + 30} seconds for {path}. "
+            "Try setting a narrower scale range, checking that the right index files are installed, "
+            "or increasing the solve timeout."
+        ) from exc
     except subprocess.CalledProcessError as exc:
         details = "\n".join(part for part in (exc.stdout, exc.stderr) if part)
         summary = textwrap.shorten(details.replace("\n", " "), width=2000, placeholder=" ...")

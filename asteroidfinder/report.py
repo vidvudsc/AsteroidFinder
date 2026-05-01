@@ -9,7 +9,9 @@ def generate_html_report(output_dir: str | Path, path: str | Path | None = None)
     """Generate a single HTML report for a demo output directory."""
 
     out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
     report_path = Path(path) if path is not None else out_dir / "report.html"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
 
     hot_rows = _read_csv(out_dir / "hot_pixel_report.csv")
     known_summary = _read_csv(out_dir / "known_objects_summary.csv")

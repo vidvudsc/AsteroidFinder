@@ -24,6 +24,7 @@ class FitsViewer(QGraphicsView):
         self._overlay_items: list[object] = []
         self._current_path: Path | None = None
         self._current_data: np.ndarray | None = None
+        self._image_rect = QRectF()
         self.inverted = False
         self.percentile_low = 0.5
         self.percentile_high = 99.5
@@ -54,8 +55,8 @@ class FitsViewer(QGraphicsView):
         self._overlay_items.clear()
 
     def fit_to_view(self) -> None:
-        if self._scene.sceneRect().isValid() and not self._scene.sceneRect().isEmpty():
-            self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        if self._image_rect.isValid() and not self._image_rect.isEmpty():
+            self.fitInView(self._image_rect, Qt.AspectRatioMode.KeepAspectRatio)
             self._zoom = 1.0
 
     def show_track_overlay(
@@ -137,7 +138,10 @@ class FitsViewer(QGraphicsView):
             self._pixmap_item = self._scene.addPixmap(pixmap)
         else:
             self._pixmap_item.setPixmap(pixmap)
-        self._scene.setSceneRect(QRectF(0, 0, pixmap.width(), pixmap.height()))
+        self._image_rect = QRectF(0, 0, pixmap.width(), pixmap.height())
+        pad_x = max(80.0, pixmap.width() * 0.18)
+        pad_y = max(80.0, pixmap.height() * 0.18)
+        self._scene.setSceneRect(QRectF(-pad_x, -pad_y, pixmap.width() + pad_x * 2, pixmap.height() + pad_y * 2))
         if keep_view:
             self.setTransform(old_transform)
             self.centerOn(old_center)

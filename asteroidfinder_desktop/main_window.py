@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+import webbrowser
 
 from astropy.wcs import WCS
-from PySide6.QtCore import QThreadPool, QTimer, Qt
+from PySide6.QtCore import QThreadPool, QTimer, Qt, QUrl
 from PySide6.QtGui import QAction, QPalette, QColor, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -30,6 +31,7 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
+    QTextBrowser,
     QToolBar,
     QVBoxLayout,
     QWidget,
@@ -39,8 +41,10 @@ from asteroidfinder.alignment import align_images
 from asteroidfinder.calibration import calibrate_images_with_persistent_hot_pixels
 from asteroidfinder.diagnostics import plot_track_diagnostics
 from asteroidfinder.io import load_image
+from asteroidfinder.known_objects import KnownObject, query_known_objects_for_frames, write_known_objects_csv
 from asteroidfinder.mpc import write_detected_track_mpc
 from asteroidfinder.platesolve import solve_image
+from asteroidfinder.report import generate_html_report
 from asteroidfinder.tracking import Track, track_moving_objects
 from asteroidfinder.workflow import run_asteroid_workflow
 
@@ -59,15 +63,18 @@ class MainWindow(QMainWindow):
         self.thread_pool.setStackSize(32 * 1024 * 1024)
         self._workers: list[FunctionWorker] = []
         self._diagnostic_windows: list[QDialog] = []
+        self._report_windows: list[QDialog] = []
         self.tracks: list[Track] = []
         self.diagnostic_paths: list[Path] = []
+        self.known_objects: list[KnownObject] = []
+        self.track_known_matches: dict[int, str] = {}
         self._current_frame_index = 0
         self._blink_timer = QTimer(self)
         self._blink_timer.timeout.connect(self._advance_blink)
 
         self.viewer = FitsViewer()
         self.frame_table = QTableWidget(0, 5)
-        self.track_table = QTableWidget(0, 7)
+        self.track_table = QTableWidget(0, 8)
         self.log = QTextEdit()
         self.log.setReadOnly(True)
         self.progress_bar = QProgressBar()
@@ -87,6 +94,11 @@ class MainWindow(QMainWindow):
         self.index_edit = QLineEdit(self.session.settings.index_dir)
         self.scale_low = _optional_double_spin()
         self.scale_high = _optional_double_spin()
+        self.solve_timeout = QSpinBox()
+        self.solve_timeout.setRange(30, 1800)
+        self.solve_timeout.setSingleStep(30)
+        self.solve_timeout.setValue(300)
+        self.solve_timeout.setToolTip("Maximum astrometry.net solve-field time per image, in seconds.")
         self.hot_sigma = _double_spin(self.session.settings.hot_sigma, 0.0, 50.0, 0.5)
         self.detect_sigma = _double_spin(self.session.settings.detect_sigma, 1.0, 20.0, 0.25)
         self.min_detections = QSpinBox()
@@ -154,6 +166,7 @@ class MainWindow(QMainWindow):
         settings.addRow("Index dir", self.index_edit)
         settings.addRow("Scale low", self.scale_low)
         settings.addRow("Scale high", self.scale_high)
+        settings.addRow("Solve timeout", self.solve_timeout)
         settings.addRow("Hot sigma", self.hot_sigma)
         settings.addRow("Detect sigma", self.detect_sigma)
         settings.addRow("Min detections", self.min_detections)
@@ -166,6 +179,8 @@ class MainWindow(QMainWindow):
             ("Plate Solve", self.run_plate_solve),
             ("Align Frames", self.run_alignment),
             ("Track Moving Objects", self.run_tracking),
+            ("Query Known Objects", self.query_known_objects),
+            ("Open Report", self.open_report_window),
             ("Full Basic Run", self.run_full_workflow),
             ("Export MPC", self.export_mpc),
         ]:
@@ -231,7 +246,9 @@ class MainWindow(QMainWindow):
         run_menu.addAction("Plate Solve", self.run_plate_solve)
         run_menu.addAction("Align Frames", self.run_alignment)
         run_menu.addAction("Track Moving Objects", self.run_tracking)
+        run_menu.addAction("Query Known Objects", self.query_known_objects)
         run_menu.addAction("Generate Movement Graphs", self.generate_movement_graphs)
+        run_menu.addAction("Open Report", self.open_report_window)
         run_menu.addAction("Full Basic Run", self.run_full_workflow)
         run_menu.addSeparator()
         run_menu.addAction("Export MPC", self.export_mpc)
@@ -260,7 +277,7 @@ class MainWindow(QMainWindow):
         plate_layout.addRow("File", self.plate_path)
         layout.addWidget(plate_box)
 
-        self.track_table.setHorizontalHeaderLabels(["ID", "Hits", "Vx", "Vy", "Sky speed", "PA", "Score"])
+        self.track_table.setHorizontalHeaderLabels(["ID", "Known", "Hits", "Vx", "Vy", "Sky speed", "PA", "Score"])
         self.track_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.track_table.itemSelectionChanged.connect(self._selected_track_changed)
         layout.addWidget(QLabel("Detected Tracks"))
@@ -356,6 +373,7 @@ class MainWindow(QMainWindow):
                     index_dir=self.session.settings.index_dir or None,
                     scale_low=self.session.settings.scale_low,
                     scale_high=self.session.settings.scale_high,
+                    timeout=self.solve_timeout.value(),
                 )
                 solved.append(result.solved_fits or result.path)
             return solved
@@ -380,6 +398,21 @@ class MainWindow(QMainWindow):
             self._error("No tracks", "Run tracking before generating movement graphs.")
             return
         self._start_worker("movement graphs", plot_track_diagnostics, self.tracks, self._output_dir() / "diagnostics")
+
+    def query_known_objects(self) -> None:
+        paths = self._require_paths(prefer_solved=True)
+        if not paths:
+            return
+
+        def query() -> list[KnownObject]:
+            objects = query_known_objects_for_frames(paths, location=self.observatory_code.text().strip() or "500")
+            write_known_objects_csv(objects, self._output_dir() / "known_objects.csv")
+            return objects
+
+        self._start_worker("known objects", query)
+
+    def open_report_window(self) -> None:
+        self._start_worker("report", generate_html_report, self._output_dir())
 
     def run_full_workflow(self) -> None:
         paths = self._require_paths()
@@ -470,12 +503,14 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(True)
         if name == "tracking":
             self.tracks = list(result)  # type: ignore[arg-type]
+            self._match_known_objects_to_tracks()
             self._populate_tracks()
             if self.tracks:
                 self.generate_movement_graphs()
         elif name == "basic workflow":
             tracks = getattr(result, "tracks", [])
             self.tracks = list(tracks)
+            self._match_known_objects_to_tracks()
             self._populate_tracks()
             if self.tracks:
                 self.generate_movement_graphs()
@@ -493,6 +528,14 @@ class MainWindow(QMainWindow):
         elif name == "movement graphs":
             self.diagnostic_paths = [Path(path) for path in result] if isinstance(result, list) else []
             self._log(f"Movement graphs written to {self._output_dir() / 'diagnostics'}")
+        elif name == "known objects":
+            self.known_objects = list(result)  # type: ignore[arg-type]
+            self._match_known_objects_to_tracks()
+            self._populate_tracks()
+            self._log(f"Known objects found: {len(self.known_objects)}")
+        elif name == "report":
+            path = Path(result) if isinstance(result, (str, Path)) else self._output_dir() / "report.html"
+            self._open_report_dialog(path)
 
     def _forget_worker(self, worker: FunctionWorker) -> None:
         if worker in self._workers:
@@ -516,6 +559,7 @@ class MainWindow(QMainWindow):
         for row, track in enumerate(self.tracks):
             values = [
                 str(row + 1),
+                self.track_known_matches.get(row, ""),
                 str(len(track.detections)),
                 f"{track.velocity_x:.3f}",
                 f"{track.velocity_y:.3f}",
@@ -583,6 +627,40 @@ class MainWindow(QMainWindow):
     def _forget_diagnostic_window(self, window: QDialog) -> None:
         if window in self._diagnostic_windows:
             self._diagnostic_windows.remove(window)
+
+    def _open_report_dialog(self, path: Path) -> None:
+        window = ReportWindow(path, parent=self)
+        window.destroyed.connect(lambda *_: self._forget_report_window(window))
+        self._report_windows.append(window)
+        window.show()
+
+    def _forget_report_window(self, window: QDialog) -> None:
+        if window in self._report_windows:
+            self._report_windows.remove(window)
+
+    def _match_known_objects_to_tracks(self, *, radius_px: float = 20.0) -> None:
+        self.track_known_matches = {}
+        if not self.tracks or not self.known_objects:
+            return
+        objects_by_frame: dict[int, list[KnownObject]] = {}
+        frame_names = [Path(frame.path).name for frame in self.session.frames]
+        for obj in self.known_objects:
+            try:
+                frame_index = frame_names.index(Path(obj.frame).name)
+            except ValueError:
+                frame_index = 0
+            objects_by_frame.setdefault(frame_index, []).append(obj)
+        for track_index, track in enumerate(self.tracks):
+            best_name = ""
+            best_distance = radius_px
+            for det in track.detections:
+                for obj in objects_by_frame.get(det.frame_index, []):
+                    distance = ((det.source.x - obj.x) ** 2 + (det.source.y - obj.y) ** 2) ** 0.5
+                    if distance <= best_distance:
+                        best_distance = distance
+                        best_name = obj.name or obj.number
+            if best_name:
+                self.track_known_matches[track_index] = best_name
 
     def _selected_track_index(self) -> int | None:
         rows = self.track_table.selectionModel().selectedRows()
@@ -917,3 +995,23 @@ class DiagnosticWindow(QDialog):
         content_layout.addStretch(1)
         scroll.setWidget(content)
         layout.addWidget(scroll)
+
+
+class ReportWindow(QDialog):
+    def __init__(self, path: Path, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.path = path
+        self.setWindowTitle("AsteroidFinder Report")
+        self.resize(1120, 780)
+        layout = QVBoxLayout(self)
+        controls = QHBoxLayout()
+        open_browser = QPushButton("Open In Browser")
+        open_browser.clicked.connect(lambda: webbrowser.open(self.path.resolve().as_uri()))
+        controls.addWidget(QLabel(str(path)))
+        controls.addStretch(1)
+        controls.addWidget(open_browser)
+        layout.addLayout(controls)
+        browser = QTextBrowser()
+        browser.setOpenExternalLinks(True)
+        browser.setSource(QUrl.fromLocalFile(str(path.resolve())))
+        layout.addWidget(browser, 1)
