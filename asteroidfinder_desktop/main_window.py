@@ -132,6 +132,7 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         open_action = QAction("Import Images", self)
+        open_action.setShortcut("Meta+O")
         open_action.triggered.connect(self.import_images)
         self.addAction(open_action)
         self._build_menus(open_action)
@@ -140,7 +141,10 @@ class MainWindow(QMainWindow):
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
         toolbar.addAction(open_action)
-        toolbar.addAction("Save Session", self.save_session_file)
+        save_action = QAction("Save Session", self)
+        save_action.setShortcut("Meta+S")
+        save_action.triggered.connect(self.save_session_file)
+        toolbar.addAction(save_action)
 
         root = QSplitter(Qt.Orientation.Horizontal)
         root.addWidget(self._workflow_panel())
@@ -180,7 +184,7 @@ class MainWindow(QMainWindow):
             ("Report", self.open_report_window),
         ]:
             button = QPushButton(label)
-            button.setMinimumHeight(38)
+            button.setMinimumHeight(28)
             button.clicked.connect(handler)
             workflow_layout.addWidget(button)
         layout.addWidget(workflow_box)
@@ -239,30 +243,58 @@ class MainWindow(QMainWindow):
         file_menu = self.menuBar().addMenu("File")
         file_menu.addAction(open_action)
         file_menu.addAction("Choose Output Folder", self.choose_output_folder)
-        file_menu.addAction("Save Session", self.save_session_file)
+        save_action = QAction("Save Session", self)
+        save_action.setShortcut("Meta+S")
+        save_action.triggered.connect(self.save_session_file)
+        file_menu.addAction(save_action)
+        file_menu.addAction("Open Report Window", self.open_report_window)
         file_menu.addSeparator()
-        file_menu.addAction("Quit", QApplication.instance().quit)
+        quit_action = QAction("Quit AsteroidFinder", self)
+        quit_action.setShortcut("Meta+Q")
+        quit_action.triggered.connect(QApplication.instance().quit)
+        file_menu.addAction(quit_action)
 
         view_menu = self.menuBar().addMenu("View")
-        view_menu.addAction("Fit Image To View", self.viewer.fit_to_view)
+        fit_action = QAction("Fit Image To View", self)
+        fit_action.setShortcut("Meta+0")
+        fit_action.triggered.connect(self.viewer.fit_to_view)
+        view_menu.addAction(fit_action)
         invert_action = QAction("Invert Image", self)
         invert_action.setCheckable(True)
+        invert_action.setShortcut("Meta+I")
         invert_action.toggled.connect(self.invert_check.setChecked)
         self.invert_check.toggled.connect(invert_action.setChecked)
         view_menu.addAction(invert_action)
+        view_menu.addSeparator()
+        full_track_action = QAction("Show Full Track", self)
+        full_track_action.setCheckable(True)
+        full_track_action.toggled.connect(self.show_full_track.setChecked)
+        self.show_full_track.toggled.connect(full_track_action.setChecked)
+        view_menu.addAction(full_track_action)
+        known_action = QAction("Show Known Objects", self)
+        known_action.setCheckable(True)
+        known_action.toggled.connect(self.show_known_objects.setChecked)
+        self.show_known_objects.toggled.connect(known_action.setChecked)
+        view_menu.addAction(known_action)
+        view_menu.addSeparator()
+        view_menu.addAction("Previous Frame", lambda: self._step_frame(-1))
+        view_menu.addAction("Next Frame", lambda: self._step_frame(1))
+        view_menu.addAction("Start/Pause Blink", self.toggle_blink)
 
-        run_menu = self.menuBar().addMenu("Run")
-        run_menu.addAction("Calibrate Hot Pixels", self.run_calibration)
-        run_menu.addAction("Plate Solve", self.run_plate_solve)
-        run_menu.addAction("Align Frames", self.run_alignment)
-        run_menu.addAction("Track Moving Objects", self.run_tracking)
-        run_menu.addAction("Query Known Objects", self.query_known_objects)
-        run_menu.addAction("Open Movement Chart", self.open_or_generate_movement_graph)
-        run_menu.addAction("Write PNG Diagnostics", self.write_png_diagnostics)
-        run_menu.addAction("Open Report", self.open_report_window)
-        run_menu.addAction("Full Basic Run", self.run_full_workflow)
-        run_menu.addSeparator()
-        run_menu.addAction("Export MPC", self.export_mpc)
+        workflow_menu = self.menuBar().addMenu("Workflow")
+        workflow_menu.addAction("Clean Hot Pixels", self.run_calibration)
+        workflow_menu.addAction("Plate Solve", self.run_plate_solve)
+        workflow_menu.addAction("Align Stars", self.run_alignment)
+        workflow_menu.addAction("Detect Movers", self.run_tracking)
+        workflow_menu.addAction("Identify Known Objects", self.query_known_objects)
+        workflow_menu.addSeparator()
+        workflow_menu.addAction("Run Basic Workflow", self.run_full_workflow)
+
+        analysis_menu = self.menuBar().addMenu("Analysis")
+        analysis_menu.addAction("Open Movement Chart", self.open_or_generate_movement_graph)
+        analysis_menu.addAction("Write PNG Diagnostics", self.write_png_diagnostics)
+        analysis_menu.addAction("Export MPC Observations", self.export_mpc)
+        analysis_menu.addAction("Open Report", self.open_report_window)
 
         help_menu = self.menuBar().addMenu("Help")
         help_menu.addAction("About AsteroidFinder", self._show_about)
@@ -934,8 +966,8 @@ def apply_dark_theme(app: QApplication) -> None:
             color: #f6fbff;
             border: 1px solid #2a8cdc;
             border-radius: 4px;
-            min-height: 34px;
-            padding: 9px 10px;
+            min-height: 26px;
+            padding: 5px 9px;
             font-weight: 600;
         }
         QPushButton:hover {
