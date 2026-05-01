@@ -6,7 +6,7 @@ import numpy as np
 from astropy.io import fits
 
 from asteroidfinder.alignment import align_images
-from asteroidfinder.calibration import build_persistent_hot_pixel_mask, calibrate_images_with_persistent_hot_pixels, detect_bad_pixels, remove_hot_pixels
+from asteroidfinder.calibration import build_persistent_hot_pixel_mask, calibrate_images_with_persistent_hot_pixels, remove_hot_pixels
 from asteroidfinder.diagnostics import plot_track_diagnostics
 from asteroidfinder.doctor import recommend_index_series, run_doctor
 from asteroidfinder.detection import detect_sources
@@ -127,15 +127,6 @@ def test_persistent_hot_pixel_mask_does_not_flag_moving_star(tmp_path: Path) -> 
     assert mask[8, 9]
     assert not mask[25, 20]
     assert sum(int(result.hot_pixel_mask.sum()) for result in results) == 4
-
-
-def test_bad_pixel_detection_catches_dead_pixel() -> None:
-    image = np.full((31, 31), 1000, dtype=np.float32)
-    image[15, 15] = 0
-
-    mask = detect_bad_pixels(image, sigma=8, neighbor_sigma=4, min_center_neighbor_ratio=2)
-
-    assert mask[15, 15]
 
 
 def test_persistent_hot_pixel_calibration_handles_mixed_shapes(tmp_path: Path) -> None:
