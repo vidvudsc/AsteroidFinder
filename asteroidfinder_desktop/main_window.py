@@ -679,8 +679,10 @@ class MainWindow(QMainWindow):
         self._diagnostic_windows.append(window)
         window.show()
 
-    def _show_track_from_chart(self, index: int) -> None:
+    def _show_track_from_chart(self, index: int, frame_index: int | None = None) -> None:
         if 0 <= index < len(self.tracks):
+            if frame_index is not None:
+                self._show_frame(frame_index)
             self.track_table.selectRow(index)
             self.viewer.clear_overlays()
             self._draw_track_indices([index], clear_first=False, mode="both")
@@ -1100,14 +1102,23 @@ class TrackChartWidget(QWidget):
         self.track_index = 0
         self.known_name = ""
         self.frame_size: tuple[int, int] | None = None
+        self.selected_offset: int | None = None
         self.zoom = 100
         self.setMinimumSize(self.sizeHint())
 
-    def set_track(self, track: Track, track_index: int, known_name: str, frame_size: tuple[int, int] | None) -> None:
+    def set_track(
+        self,
+        track: Track,
+        track_index: int,
+        known_name: str,
+        frame_size: tuple[int, int] | None,
+        selected_offset: int | None,
+    ) -> None:
         self.track = track
         self.track_index = track_index
         self.known_name = known_name
         self.frame_size = frame_size
+        self.selected_offset = selected_offset
         self.update()
 
     def set_zoom(self, zoom: int) -> None:
@@ -1236,6 +1247,12 @@ class TrackChartWidget(QWidget):
             painter.setPen(QPen(QColor("#ffffff"), 1))
             painter.setBrush(QBrush(QColor("#38bdf8")))
             painter.drawEllipse(point, radius, radius)
+            if idx == self.selected_offset:
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.setPen(QPen(QColor("#ff4f8b"), 2.6))
+                painter.drawEllipse(point, radius + 8, radius + 8)
+                painter.drawLine(QPointF(point.x() - 14, point.y()), QPointF(point.x() + 14, point.y()))
+                painter.drawLine(QPointF(point.x(), point.y() - 14), QPointF(point.x(), point.y() + 14))
             painter.setPen(QColor("#dbe7f3"))
             painter.drawText(QPointF(point.x() + 8, point.y() - 8), f"F{int(frame)}")
 
@@ -1267,8 +1284,15 @@ class TrackChartWidget(QWidget):
 
         painter.setBrush(QBrush(color))
         painter.setPen(QPen(QColor("#ffffff"), 1))
-        for point in mapped:
+        for index, point in enumerate(mapped):
             painter.drawEllipse(point, 4.5, 4.5)
+            if index == self.selected_offset:
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.setPen(QPen(QColor("#ff4f8b"), 2.0))
+                painter.drawLine(QPointF(point.x(), plot.top()), QPointF(point.x(), plot.bottom()))
+                painter.drawEllipse(point, 8.0, 8.0)
+                painter.setBrush(QBrush(color))
+                painter.setPen(QPen(QColor("#ffffff"), 1))
 
         residuals = [value - (fit[0] * frame + fit[1]) for frame, value in zip(frames, values)]
         rms = (sum(value * value for value in residuals) / len(residuals)) ** 0.5 if residuals else 0.0
@@ -1303,9 +1327,11 @@ class DiagnosticWindow(QDialog):
         self.known_matches = known_matches or {}
         self.frame_size = frame_size
         self.show_track_callback = show_track_callback
+        self.selected_offset = 0
+        self._updating_measurements = False
         self.zoom = 100
         self.setWindowTitle(title)
-        self.resize(1180, 820)
+        self.resize(1220, 860)
         layout = QVBoxLayout(self)
 
         controls = QHBoxLayout()
@@ -1337,23 +1363,70 @@ class DiagnosticWindow(QDialog):
         controls.addWidget(self.zoom_slider)
         layout.addLayout(controls)
 
+        scrub = QHBoxLayout()
+        prev_detection = _icon_button("◁", "Previous detection")
+        prev_detection.clicked.connect(lambda: self._step_detection(-1))
+        next_detection = _icon_button("▷", "Next detection")
+        next_detection.clicked.connect(lambda: self._step_detection(1))
+        self.frame_label = QLabel()
+        self.frame_label.setObjectName("MutedText")
+        self.frame_slider = QSlider(Qt.Orientation.Horizontal)
+        self.frame_slider.valueChanged.connect(self._set_detection_offset)
+        scrub.addWidget(prev_detection)
+        scrub.addWidget(next_detection)
+        scrub.addWidget(QLabel("Detection"))
+        scrub.addWidget(self.frame_slider, 1)
+        scrub.addWidget(self.frame_label)
+        layout.addLayout(scrub)
+
         self.chart = TrackChartWidget()
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(False)
         self.scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.scroll.setWidget(self.chart)
-        layout.addWidget(self.scroll, 1)
+        chart_tab = QWidget()
+        chart_layout = QVBoxLayout(chart_tab)
+        chart_layout.setContentsMargins(0, 0, 0, 0)
+        chart_layout.addWidget(self.scroll, 1)
+
+        self.measurement_table = QTableWidget(0, 8)
+        self.measurement_table.setHorizontalHeaderLabels(["Frame", "X", "Y", "SNR", "Flux", "RA", "Dec", "Residual"])
+        self.measurement_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.measurement_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.measurement_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.measurement_table.itemSelectionChanged.connect(self._measurement_selection_changed)
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(chart_tab, "Motion")
+        self.tabs.addTab(self.measurement_table, "Measurements")
+        layout.addWidget(self.tabs, 1)
         self._render()
 
     def _step(self, delta: int) -> None:
         if not self.tracks:
             return
         self.index = (self.index + delta) % len(self.tracks)
+        self.selected_offset = 0
         self._render()
+
+    def _step_detection(self, delta: int) -> None:
+        detections = self._detections()
+        if not detections:
+            return
+        self.selected_offset = (self.selected_offset + delta) % len(detections)
+        self._sync_detection_controls()
+        self._render_chart()
+
+    def _set_detection_offset(self, value: int) -> None:
+        if self._updating_measurements:
+            return
+        self.selected_offset = value
+        self._sync_detection_controls()
+        self._render_chart()
 
     def _set_zoom(self, value: int) -> None:
         self.zoom = value
-        self._render()
+        self._render_chart()
 
     def _render(self) -> None:
         if not self.tracks:
@@ -1361,18 +1434,90 @@ class DiagnosticWindow(QDialog):
             return
         track = self.tracks[self.index]
         self.caption.setText(f"{self.index + 1} / {len(self.tracks)}  AF{self.index + 1:04d}")
+        detections = self._detections()
+        self.selected_offset = min(self.selected_offset, max(len(detections) - 1, 0))
+        self._populate_measurements()
+        self._sync_detection_controls()
+        self._render_chart()
+
+    def _render_chart(self) -> None:
+        if not self.tracks:
+            return
+        track = self.tracks[self.index]
         self.chart.set_zoom(self.zoom)
-        self.chart.set_track(track, self.index, self.known_matches.get(self.index, ""), self.frame_size)
+        self.chart.set_track(track, self.index, self.known_matches.get(self.index, ""), self.frame_size, self.selected_offset)
 
     def _show_on_image(self) -> None:
         if self.show_track_callback is not None:
-            self.show_track_callback(self.index)
+            detection = self._selected_detection()
+            self.show_track_callback(self.index, None if detection is None else detection.frame_index)
 
     def _copy_summary(self) -> None:
         if not self.tracks:
             return
         track = self.tracks[self.index]
         QApplication.clipboard().setText(_track_summary(track, self.index, self.known_matches.get(self.index, "")))
+
+    def _detections(self) -> list[Any]:
+        if not self.tracks:
+            return []
+        return sorted(self.tracks[self.index].detections, key=lambda item: item.frame_index)
+
+    def _selected_detection(self) -> Any | None:
+        detections = self._detections()
+        if not detections:
+            return None
+        return detections[min(self.selected_offset, len(detections) - 1)]
+
+    def _sync_detection_controls(self) -> None:
+        detections = self._detections()
+        self._updating_measurements = True
+        self.frame_slider.setEnabled(bool(detections))
+        self.frame_slider.setRange(0, max(len(detections) - 1, 0))
+        self.frame_slider.setValue(min(self.selected_offset, max(len(detections) - 1, 0)))
+        detection = self._selected_detection()
+        if detection is None:
+            self.frame_label.setText("No detections")
+        else:
+            src = detection.source
+            self.frame_label.setText(f"frame {detection.frame_index}   x {src.x:.2f}   y {src.y:.2f}   SNR {src.snr:.1f}")
+            self.measurement_table.selectRow(self.selected_offset)
+        self._updating_measurements = False
+
+    def _populate_measurements(self) -> None:
+        detections = self._detections()
+        fit_x = _linear_fit([(float(det.frame_index), float(det.source.x)) for det in detections])
+        fit_y = _linear_fit([(float(det.frame_index), float(det.source.y)) for det in detections])
+        self._updating_measurements = True
+        self.measurement_table.setRowCount(len(detections))
+        for row, det in enumerate(detections):
+            src = det.source
+            fitted_x = fit_x[0] * det.frame_index + fit_x[1]
+            fitted_y = fit_y[0] * det.frame_index + fit_y[1]
+            residual = ((src.x - fitted_x) ** 2 + (src.y - fitted_y) ** 2) ** 0.5
+            values = [
+                str(det.frame_index),
+                f"{src.x:.3f}",
+                f"{src.y:.3f}",
+                f"{src.snr:.2f}",
+                f"{src.flux:.1f}",
+                "" if det.ra_deg is None else f"{det.ra_deg:.7f}",
+                "" if det.dec_deg is None else f"{det.dec_deg:.7f}",
+                f"{residual:.3f}",
+            ]
+            for column, value in enumerate(values):
+                self.measurement_table.setItem(row, column, QTableWidgetItem(value))
+        self._updating_measurements = False
+
+    def _measurement_selection_changed(self) -> None:
+        if self._updating_measurements:
+            return
+        rows = self.measurement_table.selectionModel().selectedRows()
+        if not rows:
+            return
+        self.selected_offset = rows[0].row()
+        self._sync_detection_controls()
+        self._render_chart()
 
 
 class ReportWindow(QDialog):
