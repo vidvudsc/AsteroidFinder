@@ -31,6 +31,7 @@ def align_images(
     reference: str | Path | None = None,
     output_dir: str | Path | None = None,
     crop_overlap: bool = False,
+    prefer_translation: bool = True,
 ) -> list[AlignedFrame]:
     """Align images to a reference using star-pattern matching."""
 
@@ -50,7 +51,7 @@ def align_images(
 
     start = 1 if reference is None else 0
     for image in loaded[start:]:
-        transform, aligned, footprint, method = _align_one(image.data, reference_image.data)
+        transform, aligned, footprint, method = _align_one(image.data, reference_image.data, prefer_translation=prefer_translation)
         rms_error, matched_sources = measure_alignment_error(aligned, reference_image.data)
         frame = AlignedFrame(image, aligned, transform, footprint, method, rms_error, matched_sources)
         result.append(frame)
@@ -140,7 +141,17 @@ def measure_alignment_error(
     return float(np.sqrt(np.mean(np.square(distances)))), len(distances)
 
 
-def _align_one(data: np.ndarray, reference: np.ndarray) -> tuple[SimilarityTransform, np.ndarray, np.ndarray, str]:
+def _align_one(
+    data: np.ndarray,
+    reference: np.ndarray,
+    *,
+    prefer_translation: bool = True,
+) -> tuple[SimilarityTransform, np.ndarray, np.ndarray, str]:
+    if prefer_translation and data.shape == reference.shape:
+        try:
+            return _align_by_phase(data, reference)
+        except ValueError:
+            pass
     try:
         transform, _ = aa.find_transform(data, reference)
         aligned = warp(
@@ -168,3 +179,48 @@ def _align_one(data: np.ndarray, reference: np.ndarray) -> tuple[SimilarityTrans
         footprint = ndi_shift(np.ones(data.shape, dtype=np.float32), shift=shift, order=0, mode="constant", cval=0.0) > 0.5
         transform = SimilarityTransform(translation=(float(shift[1]), float(shift[0])))
         return transform, aligned, footprint, "phase-correlation"
+
+
+def _align_by_phase(data: np.ndarray, reference: np.ndarray) -> tuple[SimilarityTransform, np.ndarray, np.ndarray, str]:
+    factor = _phase_downsample_factor(data.shape)
+    ref_small = _downsample_for_phase(reference, factor)
+    data_small = _downsample_for_phase(data, factor)
+    shift, _error, _phase = phase_cross_correlation(ref_small, data_small, upsample_factor=20)
+    full_shift = np.asarray(shift, dtype=np.float32) * factor
+    if not np.all(np.isfinite(full_shift)):
+        raise ValueError("phase correlation produced a non-finite shift")
+    aligned = ndi_shift(data, shift=full_shift, order=1, mode="constant", cval=0.0).astype(np.float32)
+    footprint = ndi_shift(np.ones(data.shape, dtype=np.float32), shift=full_shift, order=0, mode="constant", cval=0.0) > 0.5
+    transform = SimilarityTransform(translation=(float(full_shift[1]), float(full_shift[0])))
+    return transform, aligned, footprint, "phase-correlation-fast"
+
+
+def _phase_downsample_factor(shape: tuple[int, ...]) -> int:
+    if len(shape) < 2:
+        return 1
+    longest = max(shape[-2:])
+    if longest >= 5000:
+        return 4
+    if longest >= 2500:
+        return 2
+    return 1
+
+
+def _downsample_for_phase(data: np.ndarray, factor: int) -> np.ndarray:
+    image = np.asarray(data, dtype=np.float32)
+    if factor <= 1:
+        return _normalize_for_phase(image)
+    height = image.shape[0] // factor * factor
+    width = image.shape[1] // factor * factor
+    trimmed = image[:height, :width]
+    downsampled = trimmed.reshape(height // factor, factor, width // factor, factor).mean(axis=(1, 3)).astype(np.float32)
+    return _normalize_for_phase(downsampled)
+
+
+def _normalize_for_phase(data: np.ndarray) -> np.ndarray:
+    image = np.nan_to_num(np.asarray(data, dtype=np.float32), copy=False)
+    median = float(np.median(image))
+    std = float(np.std(image))
+    if not np.isfinite(std) or std <= 1e-6:
+        return image - median
+    return ((image - median) / std).astype(np.float32)

@@ -179,6 +179,15 @@ def test_track_moving_object_on_synthetic_sequence(tmp_path: Path) -> None:
     assert best.detections[0].photometry is not None
 
 
+def test_track_moving_object_can_skip_alignment_for_aligned_sequence(tmp_path: Path) -> None:
+    paths = _synthetic_wcs_sequence(tmp_path)
+
+    tracks = track_moving_objects(paths, sigma=5, min_detections=3, assume_aligned=True)
+
+    assert tracks
+    assert tracks[0].detections[0].photometry is not None
+
+
 def test_detected_track_mpc_export_uses_measured_track(tmp_path: Path) -> None:
     from asteroidfinder.alignment import align_images
 

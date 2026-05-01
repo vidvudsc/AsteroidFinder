@@ -39,6 +39,8 @@ def track_moving_objects(
     stationary_radius: float = 2.0,
     link_radius: float = 8.0,
     min_detections: int = 3,
+    assume_aligned: bool = False,
+    max_sources: int | None = 500,
 ) -> list[Track]:
     """Find moving-object candidates after stellar alignment.
 
@@ -47,13 +49,21 @@ def track_moving_objects(
     transient detections are linked by approximately constant pixel velocity.
     """
 
-    aligned = align_images(paths)
-    detections = [detect_sources(frame.data, sigma=sigma) for frame in aligned]
-    moving = _remove_stationary(detections, radius=stationary_radius)
-    tracks = _link_tracks(moving, link_radius=link_radius, min_detections=min_detections)
-    tracks = [_enrich_track(track, aligned) for track in tracks]
-    tracks.sort(key=lambda item: (len(item.detections), item.score), reverse=True)
-    return tracks
+    if assume_aligned:
+        from .io import load_image
+
+        loaded = [load_image(path) for path in paths]
+        aligned = [AlignedFrame(image, image.data, None, None, method="prealigned") for image in loaded]
+    else:
+        aligned = align_images(paths)
+    return track_aligned_frames(
+        aligned,
+        sigma=sigma,
+        stationary_radius=stationary_radius,
+        link_radius=link_radius,
+        min_detections=min_detections,
+        max_sources=max_sources,
+    )
 
 
 def track_aligned_frames(
@@ -64,14 +74,15 @@ def track_aligned_frames(
     link_radius: float = 8.0,
     min_detections: int = 3,
     remove_stationary_sources: bool = True,
+    max_sources: int | None = 500,
 ) -> list[Track]:
     """Find moving-object tracks in frames that are already on a common pixel grid."""
 
-    detections = [detect_sources(frame.data, sigma=sigma) for frame in aligned]
+    detections = [detect_sources(frame.data, sigma=sigma, max_sources=max_sources) for frame in aligned]
     if remove_stationary_sources:
         detections = _remove_stationary(detections, radius=stationary_radius)
     tracks = _link_tracks(detections, link_radius=link_radius, min_detections=min_detections)
-    tracks = [_enrich_track(track, aligned) for track in tracks]
+    tracks = _enrich_tracks(tracks, aligned)
     tracks.sort(key=lambda item: (len(item.detections), item.score), reverse=True)
     return tracks
 
@@ -97,18 +108,28 @@ def _remove_stationary(detections: list[list[Source]], *, radius: float) -> list
 def _link_tracks(detections: list[list[Source]], *, link_radius: float, min_detections: int) -> list[Track]:
     if len(detections) < min_detections:
         return []
+    frame_trees: list[cKDTree | None] = []
+    for frame in detections:
+        points = np.array([(src.x, src.y) for src in frame], dtype=np.float32)
+        frame_trees.append(cKDTree(points) if len(points) else None)
     tracks: list[Track] = []
+    max_candidate_tracks = 5000
     for first_index, first_frame in enumerate(detections[:-1]):
         for first in first_frame:
             candidates: list[TrackDetection] = [TrackDetection(first_index, first)]
             last = first
             for frame_index in range(first_index + 1, len(detections)):
                 frame = detections[frame_index]
-                if not frame:
+                tree = frame_trees[frame_index]
+                if not frame or tree is None:
                     continue
                 predicted = _predict(candidates, frame_index)
-                best = min(frame, key=lambda src: (src.x - predicted[0]) ** 2 + (src.y - predicted[1]) ** 2)
-                distance = float(np.hypot(best.x - predicted[0], best.y - predicted[1]))
+                distance, source_index = tree.query(predicted, distance_upper_bound=link_radius)
+                if not np.isfinite(distance):
+                    if len(candidates) == 1:
+                        predicted = (last.x, last.y)
+                    continue
+                best = frame[int(source_index)]
                 if distance <= link_radius:
                     candidates.append(TrackDetection(frame_index, best))
                     last = best
@@ -116,6 +137,8 @@ def _link_tracks(detections: list[list[Source]], *, link_radius: float, min_dete
                     predicted = (last.x, last.y)
             if len(candidates) >= min_detections:
                 tracks.append(_make_track(candidates))
+                if len(tracks) >= max_candidate_tracks:
+                    return _deduplicate_tracks(tracks)
     return _deduplicate_tracks(tracks)
 
 
@@ -142,13 +165,18 @@ def _make_track(points: list[TrackDetection]) -> Track:
     return Track(tuple(points), float(vx), float(vy), score)
 
 
-def _enrich_track(track: Track, aligned_frames: Sequence[AlignedFrame]) -> Track:
+def _enrich_tracks(tracks: Sequence[Track], aligned_frames: Sequence[AlignedFrame]) -> list[Track]:
+    wcs_by_frame = [image_wcs(frame.image) for frame in aligned_frames]
+    return [_enrich_track(track, aligned_frames, wcs_by_frame) for track in tracks]
+
+
+def _enrich_track(track: Track, aligned_frames: Sequence[AlignedFrame], wcs_by_frame: Sequence[object] | None = None) -> Track:
     enriched: list[TrackDetection] = []
     sky_points: list[tuple[int, float, float]] = []
     for detection in track.detections:
         frame = aligned_frames[detection.frame_index]
         phot = aperture_photometry(frame.data, detection.source)
-        wcs = image_wcs(frame.image)
+        wcs = wcs_by_frame[detection.frame_index] if wcs_by_frame is not None else image_wcs(frame.image)
         x_for_wcs = detection.source.x
         y_for_wcs = detection.source.y
         if frame.transform is not None:

@@ -392,7 +392,17 @@ class MainWindow(QMainWindow):
         paths = self._require_paths(prefer_aligned=True, require_same_shape=True)
         if not paths:
             return
-        self._start_worker("tracking", track_moving_objects, paths, sigma=self.detect_sigma.value(), min_detections=self.min_detections.value())
+        aligned_dir = self._output_dir() / "aligned"
+        assume_aligned = bool(paths) and all(Path(path).parent == aligned_dir for path in paths)
+        self._start_worker(
+            "tracking",
+            track_moving_objects,
+            paths,
+            sigma=self.detect_sigma.value(),
+            min_detections=self.min_detections.value(),
+            assume_aligned=assume_aligned,
+            max_sources=500,
+        )
 
     def generate_movement_graphs(self) -> None:
         self.write_png_diagnostics()

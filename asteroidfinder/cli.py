@@ -77,6 +77,8 @@ def main(argv: list[str] | None = None) -> int:
     track_p.add_argument("--out", type=Path, default=Path("tracks.csv"))
     track_p.add_argument("--sigma", type=float, default=4.0)
     track_p.add_argument("--min-detections", type=int, default=3)
+    track_p.add_argument("--assume-aligned", action="store_true", help="Skip internal star alignment and treat inputs as already aligned")
+    track_p.add_argument("--max-sources", type=int, default=500)
 
     run_p = sub.add_parser("asteroid-run", help="Calibrate, align, stack, difference, and track asteroids")
     run_p.add_argument("paths", nargs="+")
@@ -243,7 +245,13 @@ def _align(paths: list[str], args: argparse.Namespace) -> int:
 
 
 def _track(paths: list[str], args: argparse.Namespace) -> int:
-    tracks = track_moving_objects(paths, sigma=args.sigma, min_detections=args.min_detections)
+    tracks = track_moving_objects(
+        paths,
+        sigma=args.sigma,
+        min_detections=args.min_detections,
+        assume_aligned=args.assume_aligned,
+        max_sources=args.max_sources,
+    )
     write_tracks_csv(tracks, args.out)
     print(f"wrote {len(tracks)} tracks to {args.out}")
     return 0

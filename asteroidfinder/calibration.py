@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Sequence
 
 import numpy as np
+from astropy.io import fits
 from scipy.ndimage import maximum_filter, median_filter
 
 from .io import AstroImage, load_image, save_fits
@@ -195,9 +196,15 @@ def apply_hot_pixel_mask(data: np.ndarray, mask: np.ndarray, *, filter_size: int
     """Replace only the pixels in a supplied mask with local medians."""
 
     image = np.asarray(data, dtype=np.float32)
-    local = median_filter(image, size=filter_size)
     cleaned = image.copy()
-    cleaned[np.asarray(mask, dtype=bool)] = local[np.asarray(mask, dtype=bool)]
+    mask = np.asarray(mask, dtype=bool)
+    if not np.any(mask):
+        return cleaned.astype(np.float32)
+    if filter_size == 3:
+        cleaned[mask] = _masked_3x3_median(image, mask)
+    else:
+        local = median_filter(image, size=filter_size)
+        cleaned[mask] = local[mask]
     return cleaned.astype(np.float32)
 
 
@@ -226,6 +233,18 @@ def _robust_sigma(data: np.ndarray) -> float:
     return 1.4826 * mad if mad > 0 else float(np.nanstd(data))
 
 
+def _masked_3x3_median(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    padded = np.pad(image, 1, mode="edge")
+    ys, xs = np.nonzero(mask)
+    neighborhoods = np.empty((len(ys), 9), dtype=np.float32)
+    index = 0
+    for dy in range(3):
+        for dx in range(3):
+            neighborhoods[:, index] = padded[ys + dy, xs + dx]
+            index += 1
+    return np.median(neighborhoods, axis=1).astype(np.float32)
+
+
 def _optional_frame(frame: np.ndarray | str | Path | None) -> np.ndarray | None:
     if frame is None:
         return None
@@ -252,6 +271,15 @@ def _require_same_shape(images: Sequence[np.ndarray], *, context: str) -> None:
 def _group_paths_by_shape(paths: Sequence[str | Path]) -> dict[tuple[int, int], list[str | Path]]:
     groups: dict[tuple[int, int], list[str | Path]] = {}
     for path in paths:
-        shape = load_image(path).data.shape
+        shape = _image_shape(path)
         groups.setdefault(shape, []).append(path)
     return groups
+
+
+def _image_shape(path: str | Path) -> tuple[int, int]:
+    image_path = Path(path)
+    if image_path.suffix.lower() in {".fit", ".fits", ".fts", ".new"}:
+        header = fits.getheader(image_path)
+        if "NAXIS1" in header and "NAXIS2" in header:
+            return int(header["NAXIS2"]), int(header["NAXIS1"])
+    return load_image(path).data.shape
