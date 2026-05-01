@@ -172,7 +172,10 @@ class FitsViewer(QGraphicsView):
             return
         pixmap = self._current_pixmap()
         old_transform = self.transform()
+        old_h_scroll = self.horizontalScrollBar().value()
+        old_v_scroll = self.verticalScrollBar().value()
         old_center = self.mapToScene(self.viewport().rect().center())
+        old_size = (int(self._image_rect.width()), int(self._image_rect.height()))
         if self._pixmap_item is None:
             self._pixmap_item = self._scene.addPixmap(pixmap)
         else:
@@ -183,7 +186,11 @@ class FitsViewer(QGraphicsView):
         self._scene.setSceneRect(QRectF(-pad_x, -pad_y, pixmap.width() + pad_x * 2, pixmap.height() + pad_y * 2))
         if keep_view:
             self.setTransform(old_transform)
-            self.centerOn(old_center)
+            if old_size == (pixmap.width(), pixmap.height()):
+                self.horizontalScrollBar().setValue(old_h_scroll)
+                self.verticalScrollBar().setValue(old_v_scroll)
+            else:
+                self.centerOn(old_center)
         else:
             self.fit_to_view()
 
