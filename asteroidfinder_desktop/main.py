@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from importlib.resources import files
 import os
 import sys
 
@@ -14,6 +15,7 @@ def main() -> int:
     os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
     try:
+        from PySide6.QtGui import QIcon
         from PySide6.QtWidgets import QApplication
     except ImportError as exc:
         raise SystemExit(
@@ -24,8 +26,11 @@ def main() -> int:
 
     app = QApplication(sys.argv)
     app.setApplicationName("AsteroidFinder")
+    icon = QIcon(str(files("asteroidfinder_desktop").joinpath("assets/icon.png")))
+    app.setWindowIcon(icon)
     apply_dark_theme(app)
     window = MainWindow()
+    window.setWindowIcon(icon)
     window.resize(1360, 860)
     window.show()
     return app.exec()

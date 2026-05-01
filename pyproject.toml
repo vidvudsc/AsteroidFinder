@@ -32,3 +32,6 @@ asteroidfinder-desktop = "asteroidfinder_desktop.main:main"
 
 [tool.setuptools.packages.find]
 include = ["asteroidfinder*", "asteroidfinder_desktop*"]
+
+[tool.setuptools.package-data]
+asteroidfinder_desktop = ["assets/icon.png"]
