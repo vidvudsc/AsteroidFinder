@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
@@ -29,15 +30,27 @@ class FitsViewer(QGraphicsView):
         self.percentile_low = 0.5
         self.percentile_high = 99.5
         self._zoom = 1.0
+        self._data_cache: OrderedDict[Path, np.ndarray] = OrderedDict()
+        self._pixmap_cache: OrderedDict[tuple[Path, bool, float, float], QPixmap] = OrderedDict()
+        self._cache_bytes = 0
+        self._max_cache_bytes = 768 * 1024 * 1024
 
     @property
     def current_path(self) -> Path | None:
         return self._current_path
 
     def load_path(self, path: str | Path, *, keep_view: bool = False) -> None:
-        image = load_image(path)
-        self._current_path = image.path
-        self._current_data = image.data
+        path = Path(path)
+        cached = self._data_cache.get(path)
+        if cached is None:
+            image = load_image(path)
+            self._current_path = image.path
+            self._current_data = image.data
+            self._remember_data(image.path, image.data)
+        else:
+            self._data_cache.move_to_end(path)
+            self._current_path = path
+            self._current_data = cached
         self._render_current(keep_view=keep_view)
 
     def set_inverted(self, value: bool) -> None:
@@ -127,11 +140,7 @@ class FitsViewer(QGraphicsView):
     def _render_current(self, *, keep_view: bool) -> None:
         if self._current_data is None:
             return
-        stretched = stretch_to_uint8(self._current_data, percentile=(self.percentile_low, self.percentile_high))
-        if self.inverted:
-            stretched = 255 - stretched
-        image = _gray_qimage(stretched)
-        pixmap = QPixmap.fromImage(image)
+        pixmap = self._current_pixmap()
         old_transform = self.transform()
         old_center = self.mapToScene(self.viewport().rect().center())
         if self._pixmap_item is None:
@@ -147,6 +156,42 @@ class FitsViewer(QGraphicsView):
             self.centerOn(old_center)
         else:
             self.fit_to_view()
+
+    def _current_pixmap(self) -> QPixmap:
+        if self._current_data is None or self._current_path is None:
+            return QPixmap()
+        key = (self._current_path, self.inverted, self.percentile_low, self.percentile_high)
+        cached = self._pixmap_cache.get(key)
+        if cached is not None:
+            self._pixmap_cache.move_to_end(key)
+            return cached
+        stretched = stretch_to_uint8(self._current_data, percentile=(self.percentile_low, self.percentile_high))
+        if self.inverted:
+            stretched = 255 - stretched
+        pixmap = QPixmap.fromImage(_gray_qimage(stretched))
+        self._pixmap_cache[key] = pixmap
+        self._pixmap_cache.move_to_end(key)
+        self._trim_cache()
+        return pixmap
+
+    def _remember_data(self, path: Path, data: np.ndarray) -> None:
+        old = self._data_cache.pop(path, None)
+        if old is not None:
+            self._cache_bytes -= int(old.nbytes)
+        self._data_cache[path] = data
+        self._data_cache.move_to_end(path)
+        self._cache_bytes += int(data.nbytes)
+        self._trim_cache()
+
+    def _trim_cache(self) -> None:
+        while self._cache_bytes > self._max_cache_bytes and len(self._data_cache) > 1:
+            path, data = self._data_cache.popitem(last=False)
+            self._cache_bytes -= int(data.nbytes)
+            for key in list(self._pixmap_cache):
+                if key[0] == path:
+                    self._pixmap_cache.pop(key, None)
+        while len(self._pixmap_cache) > max(len(self._data_cache) * 4, 8):
+            self._pixmap_cache.popitem(last=False)
 
 
 def _gray_qimage(data: np.ndarray) -> QImage:

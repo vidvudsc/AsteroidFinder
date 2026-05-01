@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
 
 from asteroidfinder.alignment import align_images
 from asteroidfinder.calibration import calibrate_images_with_persistent_hot_pixels
+from asteroidfinder.diagnostics import plot_track_diagnostics
 from asteroidfinder.io import load_image
 from asteroidfinder.known_objects import KnownObject, query_known_objects_for_frames, write_known_objects_csv
 from asteroidfinder.mpc import write_detected_track_mpc
@@ -68,6 +69,7 @@ class MainWindow(QMainWindow):
         self.tracks: list[Track] = []
         self.known_objects: list[KnownObject] = []
         self.track_known_matches: dict[int, str] = {}
+        self._plate_info_cache: dict[Path, tuple[str, str, str, str]] = {}
         self._updating_track_table = False
         self._current_frame_index = 0
         self._blink_timer = QTimer(self)
@@ -249,6 +251,7 @@ class MainWindow(QMainWindow):
         run_menu.addAction("Track Moving Objects", self.run_tracking)
         run_menu.addAction("Query Known Objects", self.query_known_objects)
         run_menu.addAction("Open Movement Chart", self.open_or_generate_movement_graph)
+        run_menu.addAction("Write PNG Diagnostics", self.write_png_diagnostics)
         run_menu.addAction("Open Report", self.open_report_window)
         run_menu.addAction("Full Basic Run", self.run_full_workflow)
         run_menu.addSeparator()
@@ -390,7 +393,13 @@ class MainWindow(QMainWindow):
         self._start_worker("tracking", track_moving_objects, paths, sigma=self.detect_sigma.value(), min_detections=self.min_detections.value())
 
     def generate_movement_graphs(self) -> None:
-        self.open_or_generate_movement_graph()
+        self.write_png_diagnostics()
+
+    def write_png_diagnostics(self) -> None:
+        if not self.tracks:
+            self._error("No tracks", "Run tracking before writing PNG diagnostics.")
+            return
+        self._start_worker("PNG diagnostics", plot_track_diagnostics, self.tracks, self._output_dir() / "diagnostics")
 
     def open_or_generate_movement_graph(self) -> None:
         if not self.tracks:
@@ -445,7 +454,8 @@ class MainWindow(QMainWindow):
         def export() -> Path:
             from asteroidfinder.alignment import AlignedFrame
 
-            frames = [AlignedFrame(load_image(path), load_image(path).data, None, None) for path in paths]
+            images = [load_image(path) for path in paths]
+            frames = [AlignedFrame(image, image.data, None, None) for image in images]
             return write_detected_track_mpc(
                 self.tracks,
                 frames,
@@ -528,6 +538,9 @@ class MainWindow(QMainWindow):
             self._match_known_objects_to_tracks()
             self._populate_tracks()
             self._log(f"Known objects found: {len(self.known_objects)}")
+        elif name == "PNG diagnostics":
+            paths = [Path(path) for path in result] if isinstance(result, list) else []
+            self._log(f"PNG diagnostics written: {len(paths)} file(s) in {self._output_dir() / 'diagnostics'}")
         elif name == "report":
             path = Path(result) if isinstance(result, (str, Path)) else self._output_dir() / "report.html"
             self._open_report_dialog(path)
@@ -659,11 +672,18 @@ class MainWindow(QMainWindow):
             start_index=start_index,
             known_matches=self.track_known_matches,
             frame_size=frame_size,
+            show_track_callback=self._show_track_from_chart,
             parent=self,
         )
         window.destroyed.connect(lambda *_: self._forget_diagnostic_window(window))
         self._diagnostic_windows.append(window)
         window.show()
+
+    def _show_track_from_chart(self, index: int) -> None:
+        if 0 <= index < len(self.tracks):
+            self.track_table.selectRow(index)
+            self.viewer.clear_overlays()
+            self._draw_track_indices([index], clear_first=False, mode="both")
 
     def _forget_diagnostic_window(self, window: QDialog) -> None:
         if window in self._diagnostic_windows:
@@ -805,6 +825,7 @@ class MainWindow(QMainWindow):
                     has_wcs = WCS(header).has_celestial
                 except Exception:
                     has_wcs = False
+            self._plate_info_cache[path] = _plate_info_for(path, image.data.shape, header)
             return FrameInfo(
                 path=str(path),
                 width=int(image.data.shape[1]),
@@ -831,31 +852,26 @@ class MainWindow(QMainWindow):
         )
 
     def _update_plate_info(self, path: Path) -> None:
+        cached = self._plate_info_cache.get(path)
+        if cached is not None:
+            self._set_plate_info(*cached)
+            return
         try:
             image = load_image(path)
-            header = image.header
-            if header is None:
-                self._set_unsolved_plate_info(path, "No FITS header")
-                return
-            wcs = WCS(header)
-            if not wcs.has_celestial:
-                self._set_unsolved_plate_info(path, "No WCS")
-                return
-            height, width = image.data.shape
-            ra, dec = wcs.pixel_to_world_values(width / 2, height / 2)
-            scale = _pixel_scale_arcsec(wcs)
-            self.plate_status.setText("Solved WCS")
-            self.plate_center.setText(f"RA {float(ra):.6f}, Dec {float(dec):.6f}")
-            self.plate_scale.setText("unknown" if scale is None else f"{scale:.3f} arcsec/px")
-            self.plate_path.setText(path.name)
+            info = _plate_info_for(path, image.data.shape, image.header)
+            self._plate_info_cache[path] = info
+            self._set_plate_info(*info)
         except Exception as exc:
             self._set_unsolved_plate_info(path, f"Read failed: {exc}")
 
     def _set_unsolved_plate_info(self, path: Path, status: str) -> None:
+        self._set_plate_info(status, "", "", path.name)
+
+    def _set_plate_info(self, status: str, center: str, scale: str, filename: str) -> None:
         self.plate_status.setText(status)
-        self.plate_center.setText("")
-        self.plate_scale.setText("")
-        self.plate_path.setText(path.name)
+        self.plate_center.setText(center)
+        self.plate_scale.setText(scale)
+        self.plate_path.setText(filename)
 
 
 def apply_dark_theme(app: QApplication) -> None:
@@ -1008,6 +1024,46 @@ def _pixel_scale_arcsec(wcs: WCS) -> float | None:
         return float(sum(abs(value) for value in scales) / len(scales))
     except Exception:
         return None
+
+
+def _plate_info_for(path: Path, shape: tuple[int, ...], header: object | None) -> tuple[str, str, str, str]:
+    if header is None:
+        return "No FITS header", "", "", path.name
+    try:
+        wcs = WCS(header)
+        if not wcs.has_celestial:
+            return "No WCS", "", "", path.name
+        height, width = shape
+        ra, dec = wcs.pixel_to_world_values(width / 2, height / 2)
+        scale = _pixel_scale_arcsec(wcs)
+        return (
+            "Solved WCS",
+            f"RA {float(ra):.6f}, Dec {float(dec):.6f}",
+            "unknown" if scale is None else f"{scale:.3f} arcsec/px",
+            path.name,
+        )
+    except Exception as exc:
+        return f"WCS read failed: {exc}", "", "", path.name
+
+
+def _track_summary(track: Track, index: int, known_name: str = "") -> str:
+    pixel_speed = (track.velocity_x**2 + track.velocity_y**2) ** 0.5
+    sky_speed = "unknown" if track.angular_rate_arcsec_per_frame is None else f"{track.angular_rate_arcsec_per_frame:.3f} arcsec/frame"
+    pa = "unknown" if track.position_angle_deg is None else f"{track.position_angle_deg:.1f} deg"
+    lines = [
+        f"Track AF{index + 1:04d}",
+        f"Known match: {known_name or 'none'}",
+        f"Detections: {len(track.detections)}",
+        f"Pixel velocity: vx={track.velocity_x:.4f}, vy={track.velocity_y:.4f}, speed={pixel_speed:.4f} px/frame",
+        f"Sky speed: {sky_speed}",
+        f"Position angle: {pa}",
+        f"Score: {track.score:.4f}",
+        "Frame,x,y,snr,flux",
+    ]
+    for det in sorted(track.detections, key=lambda item: item.frame_index):
+        src = det.source
+        lines.append(f"{det.frame_index},{src.x:.3f},{src.y:.3f},{src.snr:.3f},{src.flux:.3f}")
+    return "\n".join(lines)
 
 
 def _linear_fit(values: list[tuple[float, float]]) -> tuple[float, float]:
@@ -1238,6 +1294,7 @@ class DiagnosticWindow(QDialog):
         start_index: int = 0,
         known_matches: dict[int, str] | None = None,
         frame_size: tuple[int, int] | None = None,
+        show_track_callback: Any | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -1245,6 +1302,7 @@ class DiagnosticWindow(QDialog):
         self.index = min(max(start_index, 0), max(len(tracks) - 1, 0))
         self.known_matches = known_matches or {}
         self.frame_size = frame_size
+        self.show_track_callback = show_track_callback
         self.zoom = 100
         self.setWindowTitle(title)
         self.resize(1180, 820)
@@ -1255,6 +1313,12 @@ class DiagnosticWindow(QDialog):
         previous.clicked.connect(lambda: self._step(-1))
         next_button = _icon_button("▶", "Next track")
         next_button.clicked.connect(lambda: self._step(1))
+        show_button = QPushButton("Show On Image")
+        show_button.clicked.connect(self._show_on_image)
+        copy_button = QPushButton("Copy Summary")
+        copy_button.clicked.connect(self._copy_summary)
+        reset_zoom = QPushButton("100%")
+        reset_zoom.clicked.connect(lambda: self.zoom_slider.setValue(100))
         self.caption = QLabel()
         self.caption.setObjectName("MutedText")
         self.zoom_slider = QSlider(Qt.Orientation.Horizontal)
@@ -1265,7 +1329,10 @@ class DiagnosticWindow(QDialog):
         self.zoom_slider.valueChanged.connect(self._set_zoom)
         controls.addWidget(previous)
         controls.addWidget(next_button)
+        controls.addWidget(show_button)
+        controls.addWidget(copy_button)
         controls.addWidget(self.caption, 1)
+        controls.addWidget(reset_zoom)
         controls.addWidget(QLabel("Zoom"))
         controls.addWidget(self.zoom_slider)
         layout.addLayout(controls)
@@ -1296,6 +1363,16 @@ class DiagnosticWindow(QDialog):
         self.caption.setText(f"{self.index + 1} / {len(self.tracks)}  AF{self.index + 1:04d}")
         self.chart.set_zoom(self.zoom)
         self.chart.set_track(track, self.index, self.known_matches.get(self.index, ""), self.frame_size)
+
+    def _show_on_image(self) -> None:
+        if self.show_track_callback is not None:
+            self.show_track_callback(self.index)
+
+    def _copy_summary(self) -> None:
+        if not self.tracks:
+            return
+        track = self.tracks[self.index]
+        QApplication.clipboard().setText(_track_summary(track, self.index, self.known_matches.get(self.index, "")))
 
 
 class ReportWindow(QDialog):
