@@ -6,8 +6,8 @@ import csv
 import webbrowser
 
 from astropy.wcs import WCS
-from PySide6.QtCore import QThreadPool, QTimer, Qt
-from PySide6.QtGui import QAction, QPalette, QColor, QPixmap
+from PySide6.QtCore import QPointF, QRectF, QSize, QThreadPool, QTimer, Qt
+from PySide6.QtGui import QAction, QBrush, QColor, QFont, QPainter, QPalette, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -41,7 +41,6 @@ from PySide6.QtWidgets import (
 
 from asteroidfinder.alignment import align_images
 from asteroidfinder.calibration import calibrate_images_with_persistent_hot_pixels
-from asteroidfinder.diagnostics import plot_track_diagnostics
 from asteroidfinder.io import load_image
 from asteroidfinder.known_objects import KnownObject, query_known_objects_for_frames, write_known_objects_csv
 from asteroidfinder.mpc import write_detected_track_mpc
@@ -67,10 +66,8 @@ class MainWindow(QMainWindow):
         self._diagnostic_windows: list[QDialog] = []
         self._report_windows: list[QDialog] = []
         self.tracks: list[Track] = []
-        self.diagnostic_paths: list[Path] = []
         self.known_objects: list[KnownObject] = []
         self.track_known_matches: dict[int, str] = {}
-        self._pending_open_graph = False
         self._updating_track_table = False
         self._current_frame_index = 0
         self._blink_timer = QTimer(self)
@@ -251,7 +248,7 @@ class MainWindow(QMainWindow):
         run_menu.addAction("Align Frames", self.run_alignment)
         run_menu.addAction("Track Moving Objects", self.run_tracking)
         run_menu.addAction("Query Known Objects", self.query_known_objects)
-        run_menu.addAction("Generate Movement Graphs", self.generate_movement_graphs)
+        run_menu.addAction("Open Movement Chart", self.open_or_generate_movement_graph)
         run_menu.addAction("Open Report", self.open_report_window)
         run_menu.addAction("Full Basic Run", self.run_full_workflow)
         run_menu.addSeparator()
@@ -289,7 +286,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.track_overlay_mode)
         layout.addWidget(self.track_table, 1)
         graph_row = QHBoxLayout()
-        graph_button = QPushButton("Open Movement Graph")
+        graph_button = QPushButton("Open Movement Chart")
         graph_button.clicked.connect(self.open_or_generate_movement_graph)
         graph_row.addWidget(graph_button)
         layout.addLayout(graph_row)
@@ -393,17 +390,16 @@ class MainWindow(QMainWindow):
         self._start_worker("tracking", track_moving_objects, paths, sigma=self.detect_sigma.value(), min_detections=self.min_detections.value())
 
     def generate_movement_graphs(self) -> None:
-        if not self.tracks:
-            self._error("No tracks", "Run tracking before generating movement graphs.")
-            return
-        self._start_worker("movement graphs", plot_track_diagnostics, self.tracks, self._output_dir() / "diagnostics")
+        self.open_or_generate_movement_graph()
 
     def open_or_generate_movement_graph(self) -> None:
-        if self.diagnostic_paths:
-            self.open_selected_movement_graph()
+        if not self.tracks:
+            self._error("No tracks", "Run tracking before opening movement charts.")
             return
-        self._pending_open_graph = True
-        self.generate_movement_graphs()
+        index = self._selected_track_index()
+        if index is None:
+            index = 0
+        self._open_graph_window(self.tracks, f"Detected Track Movement", start_index=index)
 
     def query_known_objects(self) -> None:
         paths = self._require_paths(prefer_solved=True)
@@ -511,15 +507,11 @@ class MainWindow(QMainWindow):
             self.tracks = list(result)  # type: ignore[arg-type]
             self._match_known_objects_to_tracks()
             self._populate_tracks()
-            if self.tracks:
-                self.generate_movement_graphs()
         elif name == "basic workflow":
             tracks = getattr(result, "tracks", [])
             self.tracks = list(tracks)
             self._match_known_objects_to_tracks()
             self._populate_tracks()
-            if self.tracks:
-                self.generate_movement_graphs()
         elif name == "alignment":
             aligned_dir = self._output_dir() / "aligned"
             mode = self.alignment_output.currentText()
@@ -531,12 +523,6 @@ class MainWindow(QMainWindow):
                 self.session.frames = [self._frame_info(path) for path in solved_paths]
                 self._populate_frames()
                 self._show_frame(0, keep_view=False)
-        elif name == "movement graphs":
-            self.diagnostic_paths = [Path(path) for path in result] if isinstance(result, list) else []
-            self._log(f"Movement graphs written to {self._output_dir() / 'diagnostics'}")
-            if self._pending_open_graph:
-                self._pending_open_graph = False
-                self.open_selected_movement_graph()
         elif name == "known objects":
             self.known_objects = list(result)  # type: ignore[arg-type]
             self._match_known_objects_to_tracks()
@@ -619,9 +605,9 @@ class MainWindow(QMainWindow):
         indices = self._checked_track_indices()
         self.viewer.clear_overlays()
         if indices:
-            self._draw_track_indices(indices, clear_first=False)
+            self._draw_track_indices(indices, clear_first=False, mode="path")
 
-    def _draw_track_indices(self, indices: list[int], *, clear_first: bool = True) -> None:
+    def _draw_track_indices(self, indices: list[int], *, clear_first: bool = True, mode: str | None = None) -> None:
         if clear_first:
             self.viewer.clear_overlays()
         colors = ["#38bdf8", "#fbbf24", "#a78bfa", "#34d399", "#fb7185", "#f97316"]
@@ -637,7 +623,7 @@ class MainWindow(QMainWindow):
             self.viewer.show_track_overlay(
                 points,
                 f"AF{index + 1:04d}",
-                mode=str(self.track_overlay_mode.currentData()),
+                mode=mode or str(self.track_overlay_mode.currentData()),
                 current_index=current_detection_index,
                 color=colors[index % len(colors)],
             )
@@ -652,19 +638,29 @@ class MainWindow(QMainWindow):
 
     def open_selected_movement_graph(self) -> None:
         index = self._selected_track_index()
-        if index is None or index >= len(self.diagnostic_paths):
-            self._error("No graph", "Generate movement graphs, then select a detected track.")
+        if index is None or index >= len(self.tracks):
+            self._error("No track", "Select a detected track first.")
             return
-        self._open_graph_window([self.diagnostic_paths[index]], f"Track {index + 1} Movement")
+        self._open_graph_window(self.tracks, f"Track {index + 1} Movement", start_index=index)
 
     def open_all_movement_graphs(self) -> None:
-        if not self.diagnostic_paths:
-            self._error("No graphs", "Generate movement graphs after tracking.")
+        if not self.tracks:
+            self._error("No tracks", "Run tracking before opening movement charts.")
             return
-        self._open_graph_window(self.diagnostic_paths, "All Movement Graphs")
+        self._open_graph_window(self.tracks, "All Movement Charts")
 
-    def _open_graph_window(self, paths: list[Path], title: str) -> None:
-        window = DiagnosticWindow(paths, title, parent=self)
+    def _open_graph_window(self, tracks: list[Track], title: str, *, start_index: int = 0) -> None:
+        frame_size = None
+        if self.session.frames and self.session.frames[0].width and self.session.frames[0].height:
+            frame_size = (self.session.frames[0].width, self.session.frames[0].height)
+        window = DiagnosticWindow(
+            tracks,
+            title,
+            start_index=start_index,
+            known_matches=self.track_known_matches,
+            frame_size=frame_size,
+            parent=self,
+        )
         window.destroyed.connect(lambda *_: self._forget_diagnostic_window(window))
         self._diagnostic_windows.append(window)
         window.show()
@@ -1014,26 +1010,258 @@ def _pixel_scale_arcsec(wcs: WCS) -> float | None:
         return None
 
 
-class DiagnosticWindow(QDialog):
-    def __init__(self, paths: list[Path], title: str, parent: QWidget | None = None) -> None:
+def _linear_fit(values: list[tuple[float, float]]) -> tuple[float, float]:
+    if len(values) < 2:
+        return 0.0, values[0][1] if values else 0.0
+    n = float(len(values))
+    sum_x = sum(x for x, _ in values)
+    sum_y = sum(y for _, y in values)
+    sum_xx = sum(x * x for x, _ in values)
+    sum_xy = sum(x * y for x, y in values)
+    denom = n * sum_xx - sum_x * sum_x
+    if abs(denom) < 1e-12:
+        return 0.0, sum_y / n
+    slope = (n * sum_xy - sum_x * sum_y) / denom
+    intercept = (sum_y - slope * sum_x) / n
+    return slope, intercept
+
+
+def _range_with_padding(values: list[float], padding_fraction: float = 0.12) -> tuple[float, float]:
+    if not values:
+        return 0.0, 1.0
+    low = min(values)
+    high = max(values)
+    if abs(high - low) < 1e-9:
+        return low - 1.0, high + 1.0
+    pad = (high - low) * padding_fraction
+    return low - pad, high + pad
+
+
+class TrackChartWidget(QWidget):
+    def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.paths = paths
-        self.index = 0
+        self.track: Track | None = None
+        self.track_index = 0
+        self.known_name = ""
+        self.frame_size: tuple[int, int] | None = None
+        self.zoom = 100
+        self.setMinimumSize(self.sizeHint())
+
+    def set_track(self, track: Track, track_index: int, known_name: str, frame_size: tuple[int, int] | None) -> None:
+        self.track = track
+        self.track_index = track_index
+        self.known_name = known_name
+        self.frame_size = frame_size
+        self.update()
+
+    def set_zoom(self, zoom: int) -> None:
+        self.zoom = zoom
+        self.setMinimumSize(self.sizeHint())
+        self.updateGeometry()
+        self.update()
+
+    def sizeHint(self) -> QSize:
+        scale = max(self.zoom, 40) / 100.0
+        return QSize(int(1120 * scale), int(760 * scale))
+
+    def paintEvent(self, event: object) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#070b11"))
+        if self.track is None:
+            painter.setPen(QColor("#9fb2c5"))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No track selected")
+            return
+
+        track = self.track
+        detections = sorted(track.detections, key=lambda det: det.frame_index)
+        points = [(float(det.frame_index), float(det.source.x), float(det.source.y), float(det.source.snr)) for det in detections]
+        if not points:
+            painter.setPen(QColor("#9fb2c5"))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Track has no detections")
+            return
+
+        margin = 28
+        header_h = 82
+        gap = 18
+        body = self.rect().adjusted(margin, header_h, -margin, -margin)
+        left_w = int(body.width() * 0.55)
+        path_rect = QRectF(body.left(), body.top(), left_w, body.height())
+        right_x = path_rect.right() + gap
+        right_w = body.right() - right_x
+        x_rect = QRectF(right_x, body.top(), right_w, (body.height() - gap) / 2)
+        y_rect = QRectF(right_x, x_rect.bottom() + gap, right_w, (body.height() - gap) / 2)
+
+        self._draw_header(painter, track)
+        self._draw_path_panel(painter, path_rect, points)
+        self._draw_series_panel(painter, x_rect, points, axis="x")
+        self._draw_series_panel(painter, y_rect, points, axis="y")
+
+    def _draw_header(self, painter: QPainter, track: Track) -> None:
+        title_font = QFont()
+        title_font.setPointSize(17)
+        title_font.setBold(True)
+        painter.setFont(title_font)
+        painter.setPen(QColor("#e8f3ff"))
+        name = f"AF{self.track_index + 1:04d}"
+        if self.known_name:
+            name += f"  matched {self.known_name}"
+        painter.drawText(28, 34, name)
+
+        speed = f"{track.angular_rate_arcsec_per_frame:.3f} arcsec/frame" if track.angular_rate_arcsec_per_frame is not None else "sky speed unknown"
+        pa = f"{track.position_angle_deg:.1f} deg" if track.position_angle_deg is not None else "PA unknown"
+        pixel_speed = (track.velocity_x**2 + track.velocity_y**2) ** 0.5
+        subtitle = (
+            f"{len(track.detections)} detections   "
+            f"pixel speed {pixel_speed:.3f} px/frame   "
+            f"vx {track.velocity_x:.3f}, vy {track.velocity_y:.3f}   "
+            f"{speed}   {pa}   score {track.score:.3f}"
+        )
+        detail_font = QFont()
+        detail_font.setPointSize(10)
+        painter.setFont(detail_font)
+        painter.setPen(QColor("#9fb2c5"))
+        painter.drawText(28, 62, subtitle)
+
+    def _draw_panel(self, painter: QPainter, rect: QRectF, title: str) -> None:
+        painter.setPen(QPen(QColor("#26364a"), 1))
+        painter.setBrush(QBrush(QColor("#0c1420")))
+        painter.drawRoundedRect(rect, 6, 6)
+        painter.setPen(QColor("#dbe7f3"))
+        font = QFont()
+        font.setPointSize(11)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(rect.adjusted(14, 12, -14, -12), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, title)
+        painter.setPen(QPen(QColor("#1d2a3a"), 1))
+        plot = rect.adjusted(48, 54, -22, -38)
+        for i in range(1, 5):
+            x = plot.left() + plot.width() * i / 5
+            y = plot.top() + plot.height() * i / 5
+            painter.drawLine(QPointF(x, plot.top()), QPointF(x, plot.bottom()))
+            painter.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y))
+        painter.setPen(QPen(QColor("#3b4c62"), 1))
+        painter.drawRect(plot)
+
+    def _draw_path_panel(self, painter: QPainter, rect: QRectF, points: list[tuple[float, float, float, float]]) -> None:
+        self._draw_panel(painter, rect, "Full-frame motion")
+        plot = rect.adjusted(48, 54, -22, -38)
+        if self.frame_size is None:
+            xs = [x for _, x, _, _ in points]
+            ys = [y for _, _, y, _ in points]
+            min_x, max_x = _range_with_padding(xs)
+            min_y, max_y = _range_with_padding(ys)
+        else:
+            min_x, max_x = 0.0, float(self.frame_size[0])
+            min_y, max_y = 0.0, float(self.frame_size[1])
+
+        def map_point(x: float, y: float) -> QPointF:
+            px = plot.left() + (x - min_x) / max(max_x - min_x, 1e-9) * plot.width()
+            py = plot.bottom() - (y - min_y) / max(max_y - min_y, 1e-9) * plot.height()
+            return QPointF(px, py)
+
+        fit_x = _linear_fit([(frame, x) for frame, x, _, _ in points])
+        fit_y = _linear_fit([(frame, y) for frame, _, y, _ in points])
+        frame_low = min(frame for frame, *_ in points)
+        frame_high = max(frame for frame, *_ in points)
+        fitted_start = map_point(fit_x[0] * frame_low + fit_x[1], fit_y[0] * frame_low + fit_y[1])
+        fitted_end = map_point(fit_x[0] * frame_high + fit_x[1], fit_y[0] * frame_high + fit_y[1])
+
+        mapped = [map_point(x, y) for _, x, y, _ in points]
+        painter.setPen(QPen(QColor("#2a8cdc"), 2.5))
+        for start, end in zip(mapped, mapped[1:]):
+            painter.drawLine(start, end)
+        painter.setPen(QPen(QColor("#fbbf24"), 1.8, Qt.PenStyle.DashLine))
+        painter.drawLine(fitted_start, fitted_end)
+
+        for idx, (frame, _x, _y, snr) in enumerate(points):
+            point = mapped[idx]
+            radius = max(4.0, min(10.0, 3.5 + snr / 10.0))
+            painter.setPen(QPen(QColor("#ffffff"), 1))
+            painter.setBrush(QBrush(QColor("#38bdf8")))
+            painter.drawEllipse(point, radius, radius)
+            painter.setPen(QColor("#dbe7f3"))
+            painter.drawText(QPointF(point.x() + 8, point.y() - 8), f"F{int(frame)}")
+
+        self._draw_axis_labels(painter, plot, f"x {min_x:.1f}..{max_x:.1f}", f"y {min_y:.1f}..{max_y:.1f}")
+
+    def _draw_series_panel(self, painter: QPainter, rect: QRectF, points: list[tuple[float, float, float, float]], *, axis: str) -> None:
+        value_index = 1 if axis == "x" else 2
+        label = "X position trend" if axis == "x" else "Y position trend"
+        color = QColor("#34d399") if axis == "x" else QColor("#a78bfa")
+        self._draw_panel(painter, rect, label)
+        plot = rect.adjusted(48, 54, -22, -38)
+        frames = [frame for frame, *_ in points]
+        values = [point[value_index] for point in points]
+        min_f, max_f = _range_with_padding(frames, 0.08)
+        min_v, max_v = _range_with_padding(values)
+        fit = _linear_fit([(frame, value) for frame, value in zip(frames, values)])
+
+        def map_point(frame: float, value: float) -> QPointF:
+            px = plot.left() + (frame - min_f) / max(max_f - min_f, 1e-9) * plot.width()
+            py = plot.bottom() - (value - min_v) / max(max_v - min_v, 1e-9) * plot.height()
+            return QPointF(px, py)
+
+        mapped = [map_point(frame, value) for frame, value in zip(frames, values)]
+        painter.setPen(QPen(color, 2))
+        for start, end in zip(mapped, mapped[1:]):
+            painter.drawLine(start, end)
+        painter.setPen(QPen(QColor("#fbbf24"), 1.6, Qt.PenStyle.DashLine))
+        painter.drawLine(map_point(min(frames), fit[0] * min(frames) + fit[1]), map_point(max(frames), fit[0] * max(frames) + fit[1]))
+
+        painter.setBrush(QBrush(color))
+        painter.setPen(QPen(QColor("#ffffff"), 1))
+        for point in mapped:
+            painter.drawEllipse(point, 4.5, 4.5)
+
+        residuals = [value - (fit[0] * frame + fit[1]) for frame, value in zip(frames, values)]
+        rms = (sum(value * value for value in residuals) / len(residuals)) ** 0.5 if residuals else 0.0
+        painter.setPen(QColor("#9fb2c5"))
+        painter.drawText(rect.adjusted(14, 30, -14, -10), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, f"slope {fit[0]:.4f} px/frame   RMS {rms:.3f} px")
+        self._draw_axis_labels(painter, plot, f"frame {min(frames):.0f}..{max(frames):.0f}", f"{axis} {min_v:.1f}..{max_v:.1f}")
+
+    def _draw_axis_labels(self, painter: QPainter, plot: QRectF, x_text: str, y_text: str) -> None:
+        painter.setPen(QColor("#72849a"))
+        font = QFont()
+        font.setPointSize(9)
+        painter.setFont(font)
+        painter.drawText(QPointF(plot.left(), plot.bottom() + 22), x_text)
+        painter.drawText(QPointF(plot.left() - 4, plot.top() - 10), y_text)
+
+
+class DiagnosticWindow(QDialog):
+    def __init__(
+        self,
+        tracks: list[Track],
+        title: str,
+        *,
+        start_index: int = 0,
+        known_matches: dict[int, str] | None = None,
+        frame_size: tuple[int, int] | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.tracks = tracks
+        self.index = min(max(start_index, 0), max(len(tracks) - 1, 0))
+        self.known_matches = known_matches or {}
+        self.frame_size = frame_size
         self.zoom = 100
         self.setWindowTitle(title)
-        self.resize(980, 760)
+        self.resize(1180, 820)
         layout = QVBoxLayout(self)
 
         controls = QHBoxLayout()
-        previous = QPushButton("Previous")
+        previous = _icon_button("◀", "Previous track")
         previous.clicked.connect(lambda: self._step(-1))
-        next_button = QPushButton("Next")
+        next_button = _icon_button("▶", "Next track")
         next_button.clicked.connect(lambda: self._step(1))
         self.caption = QLabel()
         self.caption.setObjectName("MutedText")
         self.zoom_slider = QSlider(Qt.Orientation.Horizontal)
-        self.zoom_slider.setRange(35, 180)
+        self.zoom_slider.setRange(45, 300)
         self.zoom_slider.setValue(self.zoom)
+        self.zoom_slider.setTickInterval(25)
+        self.zoom_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         self.zoom_slider.valueChanged.connect(self._set_zoom)
         controls.addWidget(previous)
         controls.addWidget(next_button)
@@ -1042,18 +1270,18 @@ class DiagnosticWindow(QDialog):
         controls.addWidget(self.zoom_slider)
         layout.addLayout(controls)
 
-        self.image_label = QLabel()
-        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.chart = TrackChartWidget()
         self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setWidget(self.image_label)
+        self.scroll.setWidgetResizable(False)
+        self.scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.scroll.setWidget(self.chart)
         layout.addWidget(self.scroll, 1)
         self._render()
 
     def _step(self, delta: int) -> None:
-        if not self.paths:
+        if not self.tracks:
             return
-        self.index = (self.index + delta) % len(self.paths)
+        self.index = (self.index + delta) % len(self.tracks)
         self._render()
 
     def _set_zoom(self, value: int) -> None:
@@ -1061,17 +1289,13 @@ class DiagnosticWindow(QDialog):
         self._render()
 
     def _render(self) -> None:
-        if not self.paths:
-            self.image_label.setText("No graphs")
+        if not self.tracks:
+            self.caption.setText("No tracks")
             return
-        path = self.paths[self.index]
-        pixmap = QPixmap(str(path))
-        self.caption.setText(f"{self.index + 1} / {len(self.paths)}  {path.name}")
-        if pixmap.isNull():
-            self.image_label.setText(f"Could not load {path.name}")
-            return
-        width = max(240, int(pixmap.width() * self.zoom / 100))
-        self.image_label.setPixmap(pixmap.scaledToWidth(width, Qt.TransformationMode.SmoothTransformation))
+        track = self.tracks[self.index]
+        self.caption.setText(f"{self.index + 1} / {len(self.tracks)}  AF{self.index + 1:04d}")
+        self.chart.set_zoom(self.zoom)
+        self.chart.set_track(track, self.index, self.known_matches.get(self.index, ""), self.frame_size)
 
 
 class ReportWindow(QDialog):
@@ -1119,7 +1343,7 @@ class ReportWindow(QDialog):
             ("Tracks", str(len(_read_csv_file(out_dir / "tracks.csv")))),
             ("Known objects", str(len(_read_csv_file(out_dir / "known_objects.csv")))),
             ("Alignment rows", str(len(_read_csv_file(out_dir / "alignment_report.csv")))),
-            ("Movement graphs", str(len(list((out_dir / "diagnostics").glob("*.png"))) if (out_dir / "diagnostics").exists() else 0)),
+            ("Movement charts", "native desktop viewer"),
         ]
         for label, value in metrics:
             row = QLabel(f"<b>{label}</b>: {value}")
