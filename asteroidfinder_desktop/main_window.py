@@ -90,6 +90,8 @@ class MainWindow(QMainWindow):
         self.progress_bar.setTextVisible(True)
         self.progress_label = QLabel("Idle")
         self.progress_label.setObjectName("MutedText")
+        self.progress_label.setMinimumWidth(130)
+        self.progress_label.setMaximumWidth(190)
         self.plate_status = QLabel("No frame selected")
         self.plate_center = QLabel("")
         self.plate_scale = QLabel("")
@@ -567,21 +569,24 @@ class MainWindow(QMainWindow):
         if total is None:
             self.progress_label.setText(f"Running {name}")
             self.progress_bar.setRange(0, 0)
+            self.progress_bar.setFormat("%p%")
         else:
             self.progress_label.setText(f"{name} 0/{total}")
             self.progress_bar.setRange(0, total)
             self.progress_bar.setValue(0)
+            self.progress_bar.setFormat("%p%")
         self.progress_bar.setVisible(True)
 
     def _worker_progress(self, name: str, done: int, total: int, text: str) -> None:
         if total <= 0:
             self.progress_bar.setRange(0, 0)
             self.progress_label.setText(f"Running {name}")
+            self.progress_bar.setFormat("%p%")
             return
         self.progress_bar.setRange(0, total)
         self.progress_bar.setValue(max(0, min(done, total)))
-        suffix = f": {text}" if text else ""
-        self.progress_label.setText(f"{name} {done}/{total}{suffix}")
+        self.progress_label.setText(f"{name} {done}/{total}")
+        self.progress_bar.setFormat(_progress_bar_text(text))
 
     def _worker_failed(self, name: str, details: str) -> None:
         elapsed = self._worker_elapsed_text(name)
@@ -589,6 +594,7 @@ class MainWindow(QMainWindow):
         self.progress_label.setText(f"{name} failed {elapsed}")
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("Failed")
         self.progress_bar.setVisible(True)
         self._error(f"{name} failed", _short_error(details))
 
@@ -598,6 +604,7 @@ class MainWindow(QMainWindow):
         self.progress_label.setText(f"Finished {name} {elapsed}")
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(1)
+        self.progress_bar.setFormat("Done")
         self.progress_bar.setVisible(True)
         if name == "calibration":
             results = list(result) if isinstance(result, list) else []
@@ -1170,6 +1177,19 @@ def _initial_progress_total(name: str, args: tuple[Any, ...]) -> int | None:
     if name == "alignment":
         return count * 2 + 1
     return None
+
+
+def _progress_bar_text(text: str) -> str:
+    if not text:
+        return "%p%"
+    compact = text
+    for prefix in ("Scanning ", "Solving ", "Solved ", "Aligning ", "Aligned ", "Wrote "):
+        if compact.startswith(prefix):
+            compact = prefix + Path(compact[len(prefix) :]).name
+            break
+    if len(compact) > 64:
+        compact = compact[:28] + "..." + compact[-30:]
+    return f"{compact} - %p%"
 
 
 def _pixel_scale_arcsec(wcs: WCS) -> float | None:

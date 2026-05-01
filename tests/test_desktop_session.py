@@ -6,7 +6,7 @@ import numpy as np
 
 from asteroidfinder.io import save_fits
 from asteroidfinder.known_objects import KnownObject
-from asteroidfinder_desktop.main_window import _frame_match_key, _initial_progress_total, _known_objects_matching_frame
+from asteroidfinder_desktop.main_window import _frame_match_key, _initial_progress_total, _known_objects_matching_frame, _progress_bar_text
 from asteroidfinder_desktop.session import FrameInfo, SessionState, discover_fits_files, filter_image_files, load_session, save_session
 from asteroidfinder_desktop.viewer import _display_luminance
 
@@ -94,6 +94,16 @@ def test_initial_progress_totals_for_slow_desktop_steps() -> None:
     assert _initial_progress_total("calibration", (paths,)) == 9
     assert _initial_progress_total("alignment", (paths,)) == 7
     assert _initial_progress_total("tracking", (paths,)) is None
+
+
+def test_progress_bar_text_compacts_long_filenames() -> None:
+    text = _progress_bar_text(
+        "Scanning calibrated-T68-vidvuds1-ASTEROID_SEARCH_early-20260428-233730-Color-BIN1-W-120-003.fit"
+    )
+
+    assert text.endswith(" - %p%")
+    assert len(text) < 72
+    assert "..." in text
 
 
 def _known_object(frame: Path) -> KnownObject:
