@@ -1,42 +1,93 @@
 # AsteroidFinder
 
-AsteroidFinder is a Python library and desktop app for real astronomical image
-work: plate solving, FITS inspection, alignment, blinking, hot-pixel cleanup,
-moving-object tracking, known-object lookup, and MPC-style export.
+AsteroidFinder is a Python library, CLI, and desktop app for reducing asteroid
+image sequences. It helps you clean FITS frames, plate solve them, align stars,
+detect moving objects, check whether detections match known solar-system
+objects, and prepare measured-track outputs for later MPC review.
 
-- Load FITS, FIT, JPEG, PNG, TIFF images into calibrated numeric arrays.
-- Read solved WCS from FITS headers when present.
-- Run real astrometry.net plate solving through `solve-field` when installed.
-- Detect stars/sources with SEP.
-- Align frames with real star-pattern matching using `astroalign`.
-- Stack aligned images.
-- Track moving-object candidates across an aligned image sequence.
-- Query known solar-system objects with SkyBoT when WCS is available.
-- Export measured detected-track observations to MPC-style text and CSV.
-- Generate per-track diagnostic plots with pixel motion, RA/Dec trends, speed,
-  position angle, and fit residuals.
+It does real processing. Plate solving uses embedded FITS WCS when available or
+local astrometry.net `solve-field` when configured. If a frame cannot be solved,
+AsteroidFinder reports that instead of pretending.
 
-This project does not fake plate solving. If an image has no embedded WCS and
-astrometry.net is unavailable or cannot solve it, solving fails with a clear
-exception.
+## Workflow
 
-## Quick Start
+1. Import a matching set of FITS frames.
+2. Clean calibration artifacts such as persistent hot pixels.
+3. Plate solve frames so pixel positions can be tied to sky coordinates.
+4. Align stars so real movers stand out between frames.
+5. Detect moving-object tracks.
+6. Query known objects and mark detections as known or unknown.
+7. Inspect movement charts, measurements, and residuals.
+8. Export measured observations for MPC-style review.
+
+## Install
 
 ```bash
 python3 -m pip install -e ".[dev]"
+```
+
+For the desktop app:
+
+```bash
+python3 -m pip install -e ".[desktop]"
+asteroidfinder-desktop
+```
+
+## Desktop App
+
+The desktop app is the easiest way to use the project. It focuses on the main
+reduction path:
+
+- clean hot pixels
+- plate solve
+- align stars
+- detect movers
+- identify known matches
+- export MPC-style measured tracks
+- open reports and movement charts
+
+![AsteroidFinder desktop main view](docs/main.png)
+
+![AsteroidFinder desktop inverted view](docs/main-inverted.png)
+
+## CLI Examples
+
+Inspect frames:
+
+```bash
 asteroidfinder inspect data/raw/*.fit
+```
+
+Solve one frame:
+
+```bash
 asteroidfinder solve data/raw/example.fit --out solved
+```
+
+Align a sequence:
+
+```bash
 asteroidfinder align data/raw/*.fit --out aligned
+```
+
+Detect moving objects:
+
+```bash
 asteroidfinder track data/raw/*.fit --out tracks.csv
 ```
 
-For real blind plate solving install astrometry.net locally and make sure
-`solve-field` is on your `PATH`, with suitable index files for your field of
-view.
+Run the broader asteroid workflow:
 
-## Plate Solving Setup
+```bash
+asteroidfinder asteroid-run data/raw/*.fit --out asteroidfinder_output
+```
 
-Check your machine:
+## Plate Solving
+
+For blind solving, install astrometry.net and download index files that match
+your field of view. `solve-field` must be on your `PATH`.
+
+Check your setup:
 
 ```bash
 asteroidfinder doctor \
@@ -46,13 +97,13 @@ asteroidfinder doctor \
   --scale-high 1.5
 ```
 
-Download a starter index file for a ~2 degree field:
+Download a starter 4200-series index file:
 
 ```bash
 asteroidfinder install-indexes --index-dir ~/astrometry-indexes/4200 --series 4210
 ```
 
-Then solve with:
+Then solve with the index directory:
 
 ```bash
 asteroidfinder solve data/raw/example.fit \
@@ -61,62 +112,45 @@ asteroidfinder solve data/raw/example.fit \
   --scale-high 1.5
 ```
 
-The bundled telescope demo can be run with:
+## Outputs
 
-```bash
-python demo/run_demo.py --use-raw --index-dir ~/astrometry-indexes/4200
+Typical output folders contain:
+
+- cleaned/calibrated FITS frames
+- solved FITS files with WCS
+- aligned FITS frames
+- moving-object track CSVs
+- known-object match CSVs
+- MPC-style measured-track exports
+- movement diagnostic charts
+- an HTML/report window summary
+
+## Python API
+
+```python
+from asteroidfinder import (
+    align_images,
+    load_image,
+    plot_track_diagnostics,
+    solve_image,
+    track_moving_objects,
+)
+
+frame = load_image("data/raw/image.fit")
+solution = solve_image("data/raw/image.fit")
+aligned = align_images(["data/raw/001.fit", "data/raw/002.fit"])
+tracks = track_moving_objects([
+    "data/raw/001.fit",
+    "data/raw/002.fit",
+    "data/raw/003.fit",
+])
+plot_track_diagnostics(tracks, "diagnostics")
 ```
 
 ## Demos
 
 - `demo/` runs the local telescope workflow.
-- `demo2/` runs the clean ZTF Photographica workflow and produces a structured
-  report with speed comparison, SkyBoT match tables, and track diagnostics.
+- `demo2/` runs the clean ZTF Photographica workflow.
 
-## Desktop App
-
-Install the optional desktop UI dependencies:
-
-```bash
-python3 -m pip install -e ".[desktop]"
-```
-
-Then launch the early dark-themed desktop app:
-
-```bash
-asteroidfinder-desktop
-```
-
-The desktop app is focused on the reduction path: import FITS images, inspect
-and blink frames, clean hot pixels, plate solve, align stars, detect moving
-objects, identify known matches, and export measured-track data for MPC review.
-
-![AsteroidFinder desktop main view](docs/main.png)
-
-![AsteroidFinder desktop inverted view](docs/main-inverted.png)
-
-Current desktop inspection features:
-
-- cached FITS preview and blink playback
-- WCS status and frame metadata table
-- compact workflow panel for cleaning, solving, alignment, detection,
-  identification, report generation, and MPC export
-- detected-track table with known/unknown match status
-- selected-track overlay with a single toggle for current-frame circle or full
-  motion path
-- embedded Matplotlib movement chart with pan/zoom toolbar
-- per-detection measurement table with pixel, SNR, flux, residual, and WCS
-  coordinates when available
-- report window for output CSVs and generated HTML report
-
-## Python API
-
-```python
-from asteroidfinder import load_image, solve_image, align_images, track_moving_objects, plot_track_diagnostics
-
-frame = load_image("data/raw/image.fit")
-solution = solve_image("data/raw/image.fit")
-aligned = align_images(["data/raw/001.fit", "data/raw/002.fit"])
-tracks = track_moving_objects(["data/raw/001.fit", "data/raw/002.fit", "data/raw/003.fit"])
-plot_track_diagnostics(tracks, "diagnostics")
-```
+Demo outputs are useful for checking whether solving, alignment, known-object
+matching, and mover detection are behaving as expected on real data.
