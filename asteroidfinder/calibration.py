@@ -22,7 +22,9 @@ def make_master_frame(paths: Sequence[str | Path], *, method: str = "median") ->
 
     if not paths:
         raise ValueError("No calibration frames provided")
-    cube = np.stack([load_image(path).data for path in paths]).astype(np.float32)
+    images = [load_image(path).data for path in paths]
+    _require_same_shape(images, context="master calibration frames")
+    cube = np.stack(images).astype(np.float32)
     if method == "median":
         return np.nanmedian(cube, axis=0).astype(np.float32)
     if method == "mean":
@@ -105,14 +107,17 @@ def calibrate_images_with_persistent_hot_pixels(
     must be both isolated and repeatedly hot at the same sensor coordinate.
     """
 
-    mask = build_persistent_hot_pixel_mask(
-        paths,
-        sigma=hot_sigma,
-        neighbor_sigma=neighbor_sigma,
-        min_center_neighbor_ratio=min_center_neighbor_ratio,
-        min_frames=min_frames,
-    )
-    results = [calibrate_image(path, hot_pixel_mask=mask, hot_sigma=hot_sigma, **kwargs) for path in paths]
+    grouped_paths = _group_paths_by_shape(paths)
+    results = []
+    for shape_paths in grouped_paths.values():
+        mask = build_persistent_hot_pixel_mask(
+            shape_paths,
+            sigma=hot_sigma,
+            neighbor_sigma=neighbor_sigma,
+            min_center_neighbor_ratio=min_center_neighbor_ratio,
+            min_frames=min_frames,
+        )
+        results.extend(calibrate_image(path, hot_pixel_mask=mask, hot_sigma=hot_sigma, **kwargs) for path in shape_paths)
     if output_dir is not None:
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -135,8 +140,16 @@ def build_persistent_hot_pixel_mask(
     if not paths:
         raise ValueError("No images provided")
     detections: list[np.ndarray] = []
+    shape: tuple[int, int] | None = None
     for path in paths:
         image = load_image(path).data
+        if shape is None:
+            shape = image.shape
+        elif image.shape != shape:
+            raise ValueError(
+                "Persistent hot-pixel masks require images with matching dimensions. "
+                f"Expected {shape}, got {image.shape} for {path}."
+            )
         detections.append(
             detect_isolated_hot_pixels(
                 image,
@@ -225,3 +238,20 @@ def _check_shapes(data: np.ndarray, **frames: np.ndarray | None) -> None:
     for name, frame in frames.items():
         if frame is not None and frame.shape != data.shape:
             raise ValueError(f"{name} shape {frame.shape} does not match image shape {data.shape}")
+
+
+def _require_same_shape(images: Sequence[np.ndarray], *, context: str) -> None:
+    if not images:
+        return
+    shape = images[0].shape
+    for image in images[1:]:
+        if image.shape != shape:
+            raise ValueError(f"All {context} must have the same shape. Expected {shape}, got {image.shape}.")
+
+
+def _group_paths_by_shape(paths: Sequence[str | Path]) -> dict[tuple[int, int], list[str | Path]]:
+    groups: dict[tuple[int, int], list[str | Path]] = {}
+    for path in paths:
+        shape = load_image(path).data.shape
+        groups.setdefault(shape, []).append(path)
+    return groups

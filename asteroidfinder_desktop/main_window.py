@@ -306,19 +306,19 @@ class MainWindow(QMainWindow):
         self._start_worker("plate solve", solve_all)
 
     def run_alignment(self) -> None:
-        paths = self._require_paths(prefer_solved=True)
+        paths = self._require_paths(prefer_solved=True, require_same_shape=True)
         if not paths:
             return
         self._start_worker("alignment", align_images, paths, output_dir=self._output_dir() / "aligned", crop_overlap=False)
 
     def run_tracking(self) -> None:
-        paths = self._require_paths(prefer_aligned=True)
+        paths = self._require_paths(prefer_aligned=True, require_same_shape=True)
         if not paths:
             return
         self._start_worker("tracking", track_moving_objects, paths, sigma=self.detect_sigma.value(), min_detections=self.min_detections.value())
 
     def run_full_workflow(self) -> None:
-        paths = self._require_paths()
+        paths = self._require_paths(require_same_shape=True)
         if not paths:
             return
         self._start_worker(
@@ -384,7 +384,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
-        self._error(f"{name} failed", details)
+        self._error(f"{name} failed", _short_error(details))
 
     def _worker_finished(self, name: str, result: object) -> None:
         self._log(f"Finished {name}")
@@ -478,19 +478,51 @@ class MainWindow(QMainWindow):
     def _advance_blink(self) -> None:
         self._step_frame(1)
 
-    def _require_paths(self, *, prefer_solved: bool = False, prefer_aligned: bool = False) -> list[Path]:
+    def _require_paths(
+        self,
+        *,
+        prefer_solved: bool = False,
+        prefer_aligned: bool = False,
+        require_same_shape: bool = False,
+    ) -> list[Path]:
         if prefer_aligned:
             aligned = sorted((self._output_dir() / "aligned").glob("*_aligned.fits"))
             if aligned:
-                return aligned
+                return self._validate_paths(aligned, require_same_shape=require_same_shape)
         if prefer_solved:
             solved = sorted((self._output_dir() / "solved").glob("*.new"))
             if solved:
-                return solved
+                return self._validate_paths(solved, require_same_shape=require_same_shape)
         paths = self.session.frame_paths()
         if not paths:
-            self._error("No frames", "Open a FITS folder first.")
-        return paths
+            self._error("No frames", "Import FITS images first.")
+            return []
+        return self._validate_paths(paths, require_same_shape=require_same_shape)
+
+    def _validate_paths(self, paths: list[Path], *, require_same_shape: bool) -> list[Path]:
+        if not require_same_shape:
+            return paths
+        groups = self._shape_groups(paths)
+        if len(groups) <= 1:
+            return paths
+        lines = [f"{shape[1]} x {shape[0]}: {len(shape_paths)} image(s)" for shape, shape_paths in groups.items()]
+        self._error(
+            "Image sizes do not match",
+            "This step needs all selected images to have the same dimensions.\n\n"
+            + "\n".join(lines)
+            + "\n\nImport one matching image set, or plate solve/calibrate matching frames separately.",
+        )
+        return []
+
+    def _shape_groups(self, paths: list[Path]) -> dict[tuple[int, int], list[Path]]:
+        groups: dict[tuple[int, int], list[Path]] = {}
+        for path in paths:
+            try:
+                shape = load_image(path).data.shape
+            except Exception:
+                shape = (-1, -1)
+            groups.setdefault(shape, []).append(path)
+        return groups
 
     def _output_dir(self) -> Path:
         if self.output_edit.text().strip():
@@ -686,6 +718,16 @@ def _size_text(frame: FrameInfo) -> str:
     if frame.width is None or frame.height is None:
         return ""
     return f"{frame.width} x {frame.height}"
+
+
+def _short_error(details: str) -> str:
+    lines = [line.strip() for line in details.splitlines() if line.strip()]
+    if not lines:
+        return details
+    for line in reversed(lines):
+        if "Error:" in line or "Exception:" in line or line.startswith("ValueError"):
+            return line
+    return lines[-1]
 
 
 def _pixel_scale_arcsec(wcs: WCS) -> float | None:

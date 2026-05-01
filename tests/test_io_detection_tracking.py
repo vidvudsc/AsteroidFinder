@@ -78,6 +78,20 @@ def test_persistent_hot_pixel_mask_does_not_flag_moving_star(tmp_path: Path) -> 
     assert sum(int(result.hot_pixel_mask.sum()) for result in results) == 4
 
 
+def test_persistent_hot_pixel_calibration_handles_mixed_shapes(tmp_path: Path) -> None:
+    paths = []
+    for index, shape in enumerate([(20, 20), (20, 20), (12, 16)]):
+        image = np.full(shape, 100, dtype=np.float32)
+        image[3, 4] = 8000
+        path = tmp_path / f"mixed_{index}.fits"
+        save_fits(image, path)
+        paths.append(path)
+
+    results = calibrate_images_with_persistent_hot_pixels(paths, hot_sigma=8, neighbor_sigma=4, min_center_neighbor_ratio=2)
+
+    assert [result.data.shape for result in results] == [(20, 20), (20, 20), (12, 16)]
+
+
 def test_aperture_photometry_measures_positive_flux() -> None:
     image = np.full((80, 80), 20, dtype=np.float32)
     yy, xx = np.indices(image.shape)
