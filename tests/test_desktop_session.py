@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 
 from asteroidfinder.io import save_fits
-from asteroidfinder_desktop.session import FrameInfo, SessionState, discover_fits_files, load_session, save_session
+from asteroidfinder_desktop.session import FrameInfo, SessionState, discover_fits_files, filter_image_files, load_session, save_session
 
 
 def test_discover_fits_files_only_returns_supported_images(tmp_path: Path) -> None:
@@ -16,6 +16,14 @@ def test_discover_fits_files_only_returns_supported_images(tmp_path: Path) -> No
     paths = discover_fits_files(tmp_path)
 
     assert [path.name for path in paths] == ["a.fit", "b.fits"]
+
+
+def test_filter_image_files_accepts_only_fits_like_paths(tmp_path: Path) -> None:
+    raw = [str(tmp_path / "one.fit"), str(tmp_path / "two.fits"), str(tmp_path / "preview.jpg")]
+
+    paths = filter_image_files(raw)
+
+    assert [path.name for path in paths] == ["one.fit", "two.fits"]
 
 
 def test_session_round_trip(tmp_path: Path) -> None:

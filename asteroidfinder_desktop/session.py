@@ -51,6 +51,10 @@ def discover_fits_files(folder: str | Path) -> list[Path]:
     return sorted(path for path in root.iterdir() if path.is_file() and path.suffix.lower() in FITS_EXTENSIONS)
 
 
+def filter_image_files(paths: list[str] | tuple[str, ...] | list[Path]) -> list[Path]:
+    return [Path(path).expanduser() for path in paths if Path(path).suffix.lower() in FITS_EXTENSIONS]
+
+
 def save_session(state: SessionState, path: str | Path) -> Path:
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)

@@ -38,7 +38,7 @@ from asteroidfinder.platesolve import solve_image
 from asteroidfinder.tracking import Track, track_moving_objects
 from asteroidfinder.workflow import run_asteroid_workflow
 
-from .session import FrameInfo, SessionState, discover_fits_files, save_session
+from .session import FITS_EXTENSIONS, FrameInfo, SessionState, filter_image_files, save_session
 from .viewer import FitsViewer
 from .workers import FunctionWorker
 
@@ -62,6 +62,7 @@ class MainWindow(QMainWindow):
         self.log.setReadOnly(True)
 
         self.input_edit = QLineEdit()
+        self.input_edit.setReadOnly(True)
         self.output_edit = QLineEdit()
         self.index_edit = QLineEdit(self.session.settings.index_dir)
         self.scale_low = _optional_double_spin()
@@ -81,8 +82,8 @@ class MainWindow(QMainWindow):
         self._wire_actions()
 
     def _build_ui(self) -> None:
-        open_action = QAction("Open FITS Folder", self)
-        open_action.triggered.connect(self.open_folder)
+        open_action = QAction("Import Images", self)
+        open_action.triggered.connect(self.import_images)
         self.addAction(open_action)
 
         toolbar = QToolBar("Main")
@@ -93,7 +94,7 @@ class MainWindow(QMainWindow):
 
         root = QSplitter(Qt.Orientation.Horizontal)
         root.addWidget(self._workflow_panel())
-        root.addWidget(self.viewer)
+        root.addWidget(self._center_panel())
         root.addWidget(self._analysis_panel())
         root.setStretchFactor(0, 0)
         root.setStretchFactor(1, 1)
@@ -105,15 +106,15 @@ class MainWindow(QMainWindow):
         panel.setObjectName("SidePanel")
         layout = QVBoxLayout(panel)
 
-        browse_input = QPushButton("Open")
-        browse_input.clicked.connect(self.open_folder)
+        browse_input = QPushButton("Import")
+        browse_input.clicked.connect(self.import_images)
         browse_output = QPushButton("Output")
         browse_output.clicked.connect(self.choose_output_folder)
 
         row = QHBoxLayout()
         row.addWidget(self.input_edit)
         row.addWidget(browse_input)
-        layout.addWidget(QLabel("Input FITS Folder"))
+        layout.addWidget(QLabel("Input Images"))
         layout.addLayout(row)
 
         out_row = QHBoxLayout()
@@ -147,6 +148,36 @@ class MainWindow(QMainWindow):
         layout.addStretch(1)
         return panel
 
+    def _center_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        controls = QHBoxLayout()
+        import_button = QPushButton("Import Images")
+        import_button.clicked.connect(self.import_images)
+        previous = QPushButton("Prev")
+        previous.clicked.connect(lambda: self._step_frame(-1))
+        play = QPushButton("Play")
+        play.clicked.connect(self.toggle_blink)
+        next_button = QPushButton("Next")
+        next_button.clicked.connect(lambda: self._step_frame(1))
+        fit_button = QPushButton("Fit")
+        fit_button.clicked.connect(self.viewer.fit_to_view)
+        self.invert_check.toggled.connect(self.viewer.set_inverted)
+        controls.addWidget(import_button)
+        controls.addStretch(1)
+        controls.addWidget(previous)
+        controls.addWidget(play)
+        controls.addWidget(next_button)
+        controls.addWidget(fit_button)
+        controls.addWidget(self.invert_check)
+        controls.addWidget(QLabel("Blink"))
+        controls.addWidget(self.blink_slider)
+        layout.addLayout(controls)
+        layout.addWidget(self.viewer, 1)
+        return panel
+
     def _analysis_panel(self) -> QWidget:
         panel = QWidget()
         panel.setObjectName("SidePanel")
@@ -159,22 +190,6 @@ class MainWindow(QMainWindow):
         self.frame_table.itemSelectionChanged.connect(self._selected_frame_changed)
         layout.addWidget(QLabel("Frames"))
         layout.addWidget(self.frame_table, 2)
-
-        viewer_controls = QHBoxLayout()
-        self.invert_check.toggled.connect(self.viewer.set_inverted)
-        play = QPushButton("Play")
-        play.clicked.connect(self.toggle_blink)
-        previous = QPushButton("Prev")
-        previous.clicked.connect(lambda: self._step_frame(-1))
-        next_button = QPushButton("Next")
-        next_button.clicked.connect(lambda: self._step_frame(1))
-        viewer_controls.addWidget(previous)
-        viewer_controls.addWidget(play)
-        viewer_controls.addWidget(next_button)
-        layout.addLayout(viewer_controls)
-        layout.addWidget(self.invert_check)
-        layout.addWidget(QLabel("Blink speed"))
-        layout.addWidget(self.blink_slider)
 
         self.track_table.setHorizontalHeaderLabels(["ID", "Hits", "Vx", "Vy", "Sky speed", "PA", "Score"])
         self.track_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
@@ -189,27 +204,32 @@ class MainWindow(QMainWindow):
     def _wire_actions(self) -> None:
         self.blink_slider.valueChanged.connect(lambda value: self._blink_timer.setInterval(value))
 
-    def open_folder(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Open FITS folder", self.input_edit.text() or str(Path.home()))
-        if not folder:
+    def import_images(self) -> None:
+        suffixes = " ".join(f"*{suffix}" for suffix in sorted(FITS_EXTENSIONS))
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Import FITS images",
+            str(Path.home()),
+            f"FITS images ({suffixes});;All files (*)",
+        )
+        if not files:
             return
-        self.load_folder(Path(folder))
+        self.load_paths(filter_image_files(files))
 
-    def load_folder(self, folder: Path) -> None:
-        try:
-            paths = discover_fits_files(folder)
-        except Exception as exc:
-            self._error("Could not open folder", str(exc))
+    def load_paths(self, paths: list[Path]) -> None:
+        if not paths:
+            self._error("No supported images", "Choose FITS, FIT, FTS, or solved .new files.")
             return
-        self.session.input_dir = str(folder)
-        self.session.output_dir = self.session.output_dir or str(folder / "asteroidfinder_output")
-        self.input_edit.setText(str(folder))
+        paths = sorted(paths)
+        common_parent = paths[0].parent
+        self.session.input_dir = str(common_parent)
+        self.session.output_dir = self.session.output_dir or str(common_parent / "asteroidfinder_output")
+        self.input_edit.setText(f"{len(paths)} images imported")
         self.output_edit.setText(self.session.output_dir)
         self.session.frames = [self._frame_info(path) for path in paths]
         self._populate_frames()
-        self._log(f"Loaded {len(paths)} FITS frames from {folder}")
-        if paths:
-            self._show_frame(0)
+        self._log(f"Imported {len(paths)} images")
+        self._show_frame(0, keep_view=False)
 
     def choose_output_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Choose output folder", self.output_edit.text() or str(Path.home()))
@@ -399,12 +419,12 @@ class MainWindow(QMainWindow):
         self.viewer.clear_overlays()
         self.viewer.show_track_overlay(points, f"AF{index + 1:04d}")
 
-    def _show_frame(self, index: int) -> None:
+    def _show_frame(self, index: int, *, keep_view: bool = True) -> None:
         if not self.session.frames:
             return
         self._current_frame_index = index % len(self.session.frames)
         frame = self.session.frames[self._current_frame_index]
-        self.viewer.load_path(frame.path, keep_view=True)
+        self.viewer.load_path(frame.path, keep_view=keep_view)
         self.frame_table.selectRow(self._current_frame_index)
 
     def _step_frame(self, delta: int) -> None:

@@ -27,6 +27,7 @@ class FitsViewer(QGraphicsView):
         self.inverted = False
         self.percentile_low = 0.5
         self.percentile_high = 99.5
+        self._zoom = 1.0
 
     @property
     def current_path(self) -> Path | None:
@@ -51,6 +52,11 @@ class FitsViewer(QGraphicsView):
         for item in self._overlay_items:
             self._scene.removeItem(item)
         self._overlay_items.clear()
+
+    def fit_to_view(self) -> None:
+        if self._scene.sceneRect().isValid() and not self._scene.sceneRect().isEmpty():
+            self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+            self._zoom = 1.0
 
     def show_track_overlay(self, points: list[tuple[float, float]], label: str, color: str = "#38bdf8") -> None:
         if not points:
@@ -84,6 +90,10 @@ class FitsViewer(QGraphicsView):
 
     def wheelEvent(self, event: QWheelEvent) -> None:
         factor = 1.2 if event.angleDelta().y() > 0 else 1 / 1.2
+        next_zoom = self._zoom * factor
+        if next_zoom < 0.05 or next_zoom > 80:
+            return
+        self._zoom = next_zoom
         self.scale(factor, factor)
 
     def _render_current(self, *, keep_view: bool) -> None:
@@ -105,7 +115,7 @@ class FitsViewer(QGraphicsView):
             self.setTransform(old_transform)
             self.centerOn(old_center)
         else:
-            self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+            self.fit_to_view()
 
 
 def _gray_qimage(data: np.ndarray) -> QImage:

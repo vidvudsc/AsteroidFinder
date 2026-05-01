@@ -84,9 +84,10 @@ Then launch the early dark-themed desktop app:
 asteroidfinder-desktop
 ```
 
-The first GUI version can open a FITS folder, preview and blink frames, invert
-the view, run calibration, plate solving, alignment, tracking, and export
-measured detected-track MPC files through the existing library pipeline.
+The first GUI version can import selected FITS images, preview and blink
+frames, invert the view, run calibration, plate solving, alignment, tracking,
+and export measured detected-track MPC files through the existing library
+pipeline.
 
 ## Python API
 
