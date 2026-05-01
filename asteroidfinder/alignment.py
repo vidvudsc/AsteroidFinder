@@ -6,7 +6,8 @@ from typing import Callable, Sequence
 
 import astroalign as aa
 import numpy as np
-from scipy.ndimage import shift as ndi_shift
+from astropy.wcs import WCS
+from scipy.ndimage import map_coordinates, shift as ndi_shift
 from skimage.registration import phase_cross_correlation
 from skimage.transform import SimilarityTransform, warp
 
@@ -58,7 +59,10 @@ def align_images(
     for image in loaded[start:]:
         if progress_callback is not None:
             progress_callback(done, total, f"Aligning {image.path.name}")
-        transform, aligned, footprint, method = _align_one(image.data, reference_image.data, prefer_translation=prefer_translation)
+        try:
+            transform, aligned, footprint, method = _align_by_wcs_if_possible(image, reference_image)
+        except ValueError:
+            transform, aligned, footprint, method = _align_one(image.data, reference_image.data, prefer_translation=prefer_translation)
         rms_error, matched_sources = measure_alignment_error(aligned, reference_image.data)
         frame = AlignedFrame(image, aligned, transform, footprint, method, rms_error, matched_sources)
         result.append(frame)
@@ -77,7 +81,7 @@ def align_images(
         if progress_callback is not None:
             progress_callback(total, total, "Writing aligned FITS files")
         for frame in result:
-            save_fits(frame.data, out_dir / f"{frame.image.path.stem}_aligned.fits", frame.image.header)
+            save_fits(frame.data, out_dir / f"{frame.image.path.stem}_aligned.fits", reference_image.header)
     return result
 
 
@@ -193,6 +197,55 @@ def _align_one(
         footprint = ndi_shift(np.ones(data.shape, dtype=np.float32), shift=shift, order=0, mode="constant", cval=0.0) > 0.5
         transform = SimilarityTransform(translation=(float(shift[1]), float(shift[0])))
         return transform, aligned, footprint, "phase-correlation"
+
+
+def _align_by_wcs_if_possible(image: AstroImage, reference: AstroImage) -> tuple[SimilarityTransform | None, np.ndarray, np.ndarray, str]:
+    if image.header is None or reference.header is None:
+        raise ValueError("WCS alignment requires FITS headers")
+    source_wcs = WCS(image.header)
+    reference_wcs = WCS(reference.header)
+    if not source_wcs.has_celestial or not reference_wcs.has_celestial:
+        raise ValueError("WCS alignment requires celestial WCS")
+    aligned, footprint = _reproject_to_reference_wcs(image.data, source_wcs, reference_wcs, reference.data.shape)
+    return None, aligned, footprint, "wcs-reproject"
+
+
+def _reproject_to_reference_wcs(
+    data: np.ndarray,
+    source_wcs: WCS,
+    reference_wcs: WCS,
+    output_shape: tuple[int, int],
+    *,
+    chunk_rows: int = 256,
+) -> tuple[np.ndarray, np.ndarray]:
+    height, width = output_shape
+    aligned = np.zeros(output_shape, dtype=np.float32)
+    footprint = np.zeros(output_shape, dtype=bool)
+    x_coords = np.arange(width, dtype=np.float64)
+    for y0 in range(0, height, chunk_rows):
+        y1 = min(height, y0 + chunk_rows)
+        yy, xx = np.meshgrid(np.arange(y0, y1, dtype=np.float64), x_coords, indexing="ij")
+        ra, dec = reference_wcs.pixel_to_world_values(xx, yy)
+        src_x, src_y = source_wcs.world_to_pixel_values(ra, dec)
+        valid = (
+            np.isfinite(src_x)
+            & np.isfinite(src_y)
+            & (src_x >= 0)
+            & (src_y >= 0)
+            & (src_x <= data.shape[1] - 1)
+            & (src_y <= data.shape[0] - 1)
+        )
+        sampled = map_coordinates(
+            np.asarray(data, dtype=np.float32),
+            [src_y, src_x],
+            order=1,
+            mode="constant",
+            cval=0.0,
+        ).astype(np.float32)
+        sampled[~valid] = 0.0
+        aligned[y0:y1] = sampled
+        footprint[y0:y1] = valid
+    return aligned, footprint
 
 
 def _align_by_phase(data: np.ndarray, reference: np.ndarray) -> tuple[SimilarityTransform, np.ndarray, np.ndarray, str]:

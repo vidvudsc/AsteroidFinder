@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 from astropy.io import fits
 
+from asteroidfinder.alignment import align_images
 from asteroidfinder.calibration import build_persistent_hot_pixel_mask, calibrate_images_with_persistent_hot_pixels, remove_hot_pixels
 from asteroidfinder.diagnostics import plot_track_diagnostics
 from asteroidfinder.doctor import recommend_index_series, run_doctor
@@ -188,9 +189,17 @@ def test_track_moving_object_can_skip_alignment_for_aligned_sequence(tmp_path: P
     assert tracks[0].detections[0].photometry is not None
 
 
-def test_detected_track_mpc_export_uses_measured_track(tmp_path: Path) -> None:
-    from asteroidfinder.alignment import align_images
+def test_align_images_uses_wcs_reprojection_when_available(tmp_path: Path) -> None:
+    paths = _synthetic_wcs_sequence(tmp_path)
 
+    aligned = align_images(paths, prefer_translation=False)
+
+    assert aligned[1].method == "wcs-reproject"
+    assert aligned[1].footprint is not None
+    assert aligned[1].data.shape == aligned[0].data.shape
+
+
+def test_detected_track_mpc_export_uses_measured_track(tmp_path: Path) -> None:
     paths = []
     yy, xx = np.indices((120, 120))
     stars = [(20, 20), (80, 30), (45, 90), (95, 95), (15, 75)]

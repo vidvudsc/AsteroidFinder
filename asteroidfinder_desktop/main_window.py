@@ -617,6 +617,17 @@ class MainWindow(QMainWindow):
             results = list(result) if isinstance(result, list) else []
             replaced = sum(int(item.hot_pixel_mask.sum()) for item in results if hasattr(item, "hot_pixel_mask"))
             self._log(f"Hot pixels replaced: {replaced} across {len(results)} frame(s)")
+            calibrated_dir = self._output_dir() / "calibrated"
+            calibrated_paths = [
+                calibrated_dir / f"{item.image.path.stem}_calibrated.fits"
+                for item in results
+                if hasattr(item, "image")
+            ]
+            existing = [path for path in calibrated_paths if path.exists()]
+            if existing:
+                self.session.frames = [self._frame_info(path) for path in existing]
+                self._populate_frames()
+                self._show_frame(0, keep_view=False)
         elif name == "tracking":
             self.tracks = list(result)  # type: ignore[arg-type]
             self._match_known_objects_to_tracks()
