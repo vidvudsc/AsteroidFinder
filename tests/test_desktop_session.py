@@ -8,7 +8,7 @@ from PySide6.QtWidgets import QApplication
 
 from asteroidfinder.io import save_fits
 from asteroidfinder.known_objects import KnownObject
-from asteroidfinder_desktop.main_window import MainWindow, _frame_match_key, _initial_progress_total, _known_objects_matching_frame, _progress_bar_text
+from asteroidfinder_desktop.main_window import MainWindow, _frame_match_key, _import_status_text, _initial_progress_total, _known_objects_matching_frame, _progress_bar_text
 from asteroidfinder_desktop.session import FrameInfo, SessionState, discover_fits_files, filter_image_files, load_session, save_session
 from asteroidfinder_desktop.viewer import _display_luminance
 
@@ -43,6 +43,12 @@ def test_desktop_import_skips_empty_corrupt_fits(tmp_path: Path) -> None:
     window.load_paths([corrupt, valid])
 
     assert [Path(frame.path).name for frame in window.session.frames] == ["valid.fit"]
+    assert window.input_edit.text() == "1 images imported, 1 skipped"
+
+
+def test_import_status_mentions_skipped_images() -> None:
+    assert _import_status_text(4, 1) == "4 images imported, 1 skipped"
+    assert _import_status_text(4, 0) == "4 images imported"
 
 
 def test_session_round_trip(tmp_path: Path) -> None:

@@ -79,6 +79,7 @@ class MainWindow(QMainWindow):
         self.known_objects: list[KnownObject] = []
         self.track_known_matches: dict[int, str] = {}
         self.visible_track_indices: set[int] = set()
+        self._last_skipped_images = 0
         self._worker_started_at: dict[str, float] = {}
         self._worker_progress_totals: dict[str, int] = {}
         self._plate_info_cache: dict[Path, tuple[str, str, str, str]] = {}
@@ -379,6 +380,7 @@ class MainWindow(QMainWindow):
             self._error("No supported images", "Choose FITS, FIT, FTS, or solved .new files.")
             return
         paths = natural_sorted(paths)
+        selected_count = len(paths)
         paths = self._filter_readable_paths(paths, show_message=True)
         if not paths:
             self._error("No readable images", "All selected images were empty, corrupt, or unsupported.")
@@ -386,11 +388,12 @@ class MainWindow(QMainWindow):
         common_parent = paths[0].parent
         self.session.input_dir = str(common_parent)
         self.session.output_dir = self.session.output_dir or str(common_parent / "asteroidfinder_output")
-        self.input_edit.setText(f"{len(paths)} images imported")
+        skipped = selected_count - len(paths)
+        self.input_edit.setText(_import_status_text(len(paths), skipped))
         self.output_edit.setText(self.session.output_dir)
         self.session.frames = [self._frame_info(path) for path in paths]
         self._populate_frames()
-        self._log(f"Imported {len(paths)} images")
+        self._log(_import_status_text(len(paths), skipped))
         self._show_frame(0, keep_view=False)
 
     def choose_output_folder(self) -> None:
@@ -1015,6 +1018,7 @@ class MainWindow(QMainWindow):
             self._log(f"Skipped unreadable image: {path.name} ({detail})")
         if skipped and show_message:
             self._log(f"Skipped {len(skipped)} unreadable image(s); continuing with {len(readable)} readable image(s).")
+        self._last_skipped_images = len(skipped)
         return readable
 
     def _validate_paths(self, paths: list[Path], *, require_same_shape: bool, show_error: bool = True) -> list[Path]:
@@ -1261,6 +1265,12 @@ def _size_text(frame: FrameInfo) -> str:
     if frame.width is None or frame.height is None:
         return ""
     return f"{frame.width} x {frame.height}"
+
+
+def _import_status_text(imported: int, skipped: int) -> str:
+    if skipped:
+        return f"{imported} images imported, {skipped} skipped"
+    return f"{imported} images imported"
 
 
 def _icon_button(text: str, tooltip: str) -> QPushButton:
