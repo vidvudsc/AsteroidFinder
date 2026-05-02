@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,17 @@ from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPen, QPixmap, QWhee
 from PySide6.QtWidgets import QGraphicsEllipseItem, QGraphicsPixmapItem, QGraphicsScene, QGraphicsTextItem, QGraphicsView
 
 from asteroidfinder.io import load_image, stretch_to_uint8
+
+
+@dataclass(frozen=True)
+class PreparedDisplayFrame:
+    path: Path
+    data: np.ndarray
+    header: Any | None
+    pixels: np.ndarray
+    inverted: bool
+    percentile_low: float
+    percentile_high: float
 
 
 class FitsViewer(QGraphicsView):
@@ -58,6 +70,23 @@ class FitsViewer(QGraphicsView):
             self._current_data = cached
             self._current_header = self._header_cache.get(path)
         self._render_current(keep_view=keep_view)
+
+    def can_show_cached(self, path: str | Path) -> bool:
+        path = Path(path)
+        key = (path, self.inverted, self.percentile_low, self.percentile_high)
+        return key in self._pixmap_cache
+
+    def show_prepared_frame(self, frame: PreparedDisplayFrame, *, keep_view: bool = False) -> None:
+        self._current_path = frame.path
+        self._current_data = frame.data
+        self._current_header = frame.header
+        self._remember_data(frame.path, frame.data, frame.header)
+        key = (frame.path, frame.inverted, frame.percentile_low, frame.percentile_high)
+        pixmap = QPixmap.fromImage(_gray_qimage(frame.pixels))
+        self._pixmap_cache[key] = pixmap
+        self._pixmap_cache.move_to_end(key)
+        self._trim_cache()
+        self._render_pixmap(pixmap, keep_view=keep_view)
 
     def set_inverted(self, value: bool) -> None:
         self.inverted = value
@@ -177,6 +206,9 @@ class FitsViewer(QGraphicsView):
         if self._current_data is None:
             return
         pixmap = self._current_pixmap()
+        self._render_pixmap(pixmap, keep_view=keep_view)
+
+    def _render_pixmap(self, pixmap: QPixmap, *, keep_view: bool) -> None:
         old_transform = self.transform()
         old_h_scroll = self.horizontalScrollBar().value()
         old_v_scroll = self.verticalScrollBar().value()
@@ -252,6 +284,29 @@ def _display_luminance(data: np.ndarray, header: Any | None = None) -> np.ndarra
     if data.ndim != 2 or not _is_bayer_mosaic(header):
         return data
     return _smooth_bayer_luminance(data)
+
+
+def prepare_display_frame(
+    path: str | Path,
+    *,
+    inverted: bool,
+    percentile_low: float,
+    percentile_high: float,
+) -> PreparedDisplayFrame:
+    image = load_image(path)
+    display_data = _display_luminance(image.data, image.header)
+    pixels = stretch_to_uint8(display_data, percentile=(percentile_low, percentile_high))
+    if inverted:
+        pixels = 255 - pixels
+    return PreparedDisplayFrame(
+        path=image.path,
+        data=image.data,
+        header=image.header,
+        pixels=pixels,
+        inverted=inverted,
+        percentile_low=percentile_low,
+        percentile_high=percentile_high,
+    )
 
 
 def _is_bayer_mosaic(header: Any | None) -> bool:

@@ -60,7 +60,7 @@ from asteroidfinder.tracking import Track, track_moving_objects
 from asteroidfinder.workflow import run_asteroid_workflow
 
 from .session import FITS_EXTENSIONS, IMAGE_EXTENSIONS, FrameInfo, SessionState, filter_image_files, natural_sorted, save_session
-from .viewer import FitsViewer
+from .viewer import FitsViewer, PreparedDisplayFrame, prepare_display_frame
 from .workers import FunctionWorker
 
 
@@ -72,7 +72,11 @@ class MainWindow(QMainWindow):
         self.thread_pool = QThreadPool.globalInstance()
         self.thread_pool.setMaxThreadCount(1)
         self.thread_pool.setStackSize(32 * 1024 * 1024)
+        self.frame_thread_pool = QThreadPool(self)
+        self.frame_thread_pool.setMaxThreadCount(1)
+        self.frame_thread_pool.setStackSize(32 * 1024 * 1024)
         self._workers: list[FunctionWorker] = []
+        self._frame_workers: list[FunctionWorker] = []
         self._diagnostic_windows: list[QDialog] = []
         self._report_windows: list[QDialog] = []
         self._qa_windows: list[QDialog] = []
@@ -86,6 +90,9 @@ class MainWindow(QMainWindow):
         self._plate_info_cache: dict[Path, tuple[str, str, str, str]] = {}
         self._updating_track_table = False
         self._current_frame_index = 0
+        self._frame_load_serial = 0
+        self._frame_load_in_progress = False
+        self._blink_pending_advance = False
         self._blink_timer = QTimer(self)
         self._blink_timer.timeout.connect(self._advance_blink)
 
@@ -966,19 +973,87 @@ class MainWindow(QMainWindow):
             return
         self._current_frame_index = index % len(self.session.frames)
         frame = self.session.frames[self._current_frame_index]
-        self.viewer.load_path(frame.path, keep_view=keep_view)
         signals_blocked = self.frame_table.blockSignals(True)
         self.frame_table.selectRow(self._current_frame_index)
         self.frame_table.blockSignals(signals_blocked)
         self._update_plate_info(Path(frame.path))
-        self._draw_checked_tracks()
+        self.viewer.clear_overlays()
+        if self.viewer.can_show_cached(frame.path):
+            self._frame_load_serial += 1
+            self._frame_load_in_progress = False
+            self.viewer.load_path(frame.path, keep_view=keep_view)
+            self._draw_checked_tracks()
+            return
+        self._load_frame_async(Path(frame.path), keep_view=keep_view)
 
     def _step_frame(self, delta: int) -> None:
         if self.session.frames:
             self._show_frame(self._current_frame_index + delta)
 
     def _advance_blink(self) -> None:
+        if self._frame_load_in_progress:
+            self._blink_pending_advance = True
+            return
         self._step_frame(1)
+
+    def _load_frame_async(self, path: Path, *, keep_view: bool) -> None:
+        self._frame_load_serial += 1
+        serial = self._frame_load_serial
+        self._frame_load_in_progress = True
+        self.progress_label.setText(f"Loading {path.name[:32]}")
+        worker = FunctionWorker(
+            "frame display",
+            prepare_display_frame,
+            path,
+            inverted=self.viewer.inverted,
+            percentile_low=self.viewer.percentile_low,
+            percentile_high=self.viewer.percentile_high,
+        )
+        worker.signals.finished.connect(
+            lambda _name, result, request_serial=serial, request_keep_view=keep_view: self._frame_display_loaded(
+                request_serial,
+                result,
+                keep_view=request_keep_view,
+            )
+        )
+        worker.signals.failed.connect(
+            lambda _name, details, request_serial=serial, request_path=path: self._frame_display_failed(
+                request_serial,
+                request_path,
+                details,
+            )
+        )
+        worker.signals.finished.connect(lambda *_: self._forget_frame_worker(worker))
+        worker.signals.failed.connect(lambda *_: self._forget_frame_worker(worker))
+        self._frame_workers.append(worker)
+        self.frame_thread_pool.start(worker)
+
+    def _frame_display_loaded(self, serial: int, result: object, *, keep_view: bool) -> None:
+        if serial != self._frame_load_serial:
+            return
+        self._frame_load_in_progress = False
+        if not isinstance(result, PreparedDisplayFrame):
+            self._log("Frame display failed: unexpected loader result")
+            return
+        self.viewer.show_prepared_frame(result, keep_view=keep_view)
+        if not self._workers:
+            self.progress_label.setText("Idle")
+        self._draw_checked_tracks()
+        if self._blink_timer.isActive() and self._blink_pending_advance:
+            self._blink_pending_advance = False
+            QTimer.singleShot(0, self._advance_blink)
+
+    def _frame_display_failed(self, serial: int, path: Path, details: str) -> None:
+        if serial != self._frame_load_serial:
+            return
+        self._frame_load_in_progress = False
+        self._log(f"Frame display failed for {path.name}: {_short_error(details)}")
+        if not self._workers:
+            self.progress_label.setText("Idle")
+
+    def _forget_frame_worker(self, worker: FunctionWorker) -> None:
+        if worker in self._frame_workers:
+            self._frame_workers.remove(worker)
 
     def _require_paths(
         self,
