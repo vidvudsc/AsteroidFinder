@@ -379,6 +379,10 @@ class MainWindow(QMainWindow):
             self._error("No supported images", "Choose FITS, FIT, FTS, or solved .new files.")
             return
         paths = natural_sorted(paths)
+        paths = self._filter_readable_paths(paths, show_message=True)
+        if not paths:
+            self._error("No readable images", "All selected images were empty, corrupt, or unsupported.")
+            return
         common_parent = paths[0].parent
         self.session.input_dir = str(common_parent)
         self.session.output_dir = self.session.output_dir or str(common_parent / "asteroidfinder_output")
@@ -980,6 +984,7 @@ class MainWindow(QMainWindow):
         if prefer_aligned:
             aligned = natural_sorted((self._output_dir() / "aligned").glob("*_aligned.fits"))
             if aligned:
+                aligned = self._filter_readable_paths(aligned)
                 valid_aligned = self._validate_paths(aligned, require_same_shape=require_same_shape, show_error=False)
                 if valid_aligned:
                     return valid_aligned
@@ -987,12 +992,30 @@ class MainWindow(QMainWindow):
         if prefer_solved:
             solved = natural_sorted((self._output_dir() / "solved").glob("*.new"))
             if solved:
+                solved = self._filter_readable_paths(solved)
                 return self._validate_paths(solved, require_same_shape=require_same_shape)
         paths = self.session.frame_paths()
+        paths = self._filter_readable_paths(paths, show_message=True)
         if not paths:
             self._error("No frames", "Import FITS images first.")
             return []
         return self._validate_paths(paths, require_same_shape=require_same_shape)
+
+    def _filter_readable_paths(self, paths: list[Path], *, show_message: bool = False) -> list[Path]:
+        readable: list[Path] = []
+        skipped: list[tuple[Path, str]] = []
+        for path in paths:
+            try:
+                load_image(path)
+            except Exception as exc:
+                skipped.append((path, str(exc)))
+                continue
+            readable.append(path)
+        for path, detail in skipped:
+            self._log(f"Skipped unreadable image: {path.name} ({detail})")
+        if skipped and show_message:
+            self._log(f"Skipped {len(skipped)} unreadable image(s); continuing with {len(readable)} readable image(s).")
+        return readable
 
     def _validate_paths(self, paths: list[Path], *, require_same_shape: bool, show_error: bool = True) -> list[Path]:
         if not require_same_shape:

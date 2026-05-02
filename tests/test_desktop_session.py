@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 
 import numpy as np
+from PySide6.QtWidgets import QApplication
 
 from asteroidfinder.io import save_fits
 from asteroidfinder.known_objects import KnownObject
-from asteroidfinder_desktop.main_window import _frame_match_key, _initial_progress_total, _known_objects_matching_frame, _progress_bar_text
+from asteroidfinder_desktop.main_window import MainWindow, _frame_match_key, _initial_progress_total, _known_objects_matching_frame, _progress_bar_text
 from asteroidfinder_desktop.session import FrameInfo, SessionState, discover_fits_files, filter_image_files, load_session, save_session
 from asteroidfinder_desktop.viewer import _display_luminance
 
@@ -27,6 +29,20 @@ def test_filter_image_files_accepts_supported_image_paths(tmp_path: Path) -> Non
     paths = filter_image_files(raw)
 
     assert [path.name for path in paths] == ["one.fit", "two.fits", "preview.jpg"]
+
+
+def test_desktop_import_skips_empty_corrupt_fits(tmp_path: Path) -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    valid = tmp_path / "valid.fit"
+    corrupt = tmp_path / "corrupt.fit"
+    save_fits(np.zeros((4, 5), dtype=np.float32), valid)
+    corrupt.write_bytes(b"")
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+
+    window.load_paths([corrupt, valid])
+
+    assert [Path(frame.path).name for frame in window.session.frames] == ["valid.fit"]
 
 
 def test_session_round_trip(tmp_path: Path) -> None:
