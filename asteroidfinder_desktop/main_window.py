@@ -64,6 +64,10 @@ from .viewer import FitsViewer, PreparedDisplayFrame, prepare_display_frame
 from .workers import FunctionWorker
 
 
+WORKFLOW_PANEL_WIDTH = 320
+ANALYSIS_PANEL_WIDTH = 380
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -98,6 +102,7 @@ class MainWindow(QMainWindow):
         self._blink_timer.timeout.connect(self._advance_blink)
 
         self.viewer = FitsViewer()
+        self.viewer.on_frame_step = self._step_frame
         self.frame_table = QTableWidget(0, 5)
         self.track_table = QTableWidget(0, 7)
         self.log = QTextEdit()
@@ -179,6 +184,7 @@ class MainWindow(QMainWindow):
     def _workflow_panel(self) -> QWidget:
         panel = QWidget()
         panel.setObjectName("SidePanel")
+        _lock_panel_width(panel, WORKFLOW_PANEL_WIDTH)
         layout = QVBoxLayout(panel)
 
         browse_output = QPushButton("Output")
@@ -331,6 +337,7 @@ class MainWindow(QMainWindow):
     def _analysis_panel(self) -> QWidget:
         panel = QWidget()
         panel.setObjectName("SidePanel")
+        _lock_panel_width(panel, ANALYSIS_PANEL_WIDTH)
         layout = QVBoxLayout(panel)
 
         self.frame_table.setHorizontalHeaderLabels(["Frame", "Time", "Filter", "Size", "WCS"])
@@ -1009,9 +1016,9 @@ class MainWindow(QMainWindow):
             return
         self._load_frame_async(Path(frame.path), keep_view=keep_view)
 
-    def _step_frame(self, delta: int) -> None:
+    def _step_frame(self, delta: int, *, keep_view: bool = True) -> None:
         if self.session.frames:
-            self._show_frame(self._current_frame_index + delta)
+            self._show_frame(self._current_frame_index + delta, keep_view=keep_view)
 
     def _advance_blink(self) -> None:
         if self._frame_load_in_progress:
@@ -1365,6 +1372,12 @@ def _size_text(frame: FrameInfo) -> str:
     if frame.width is None or frame.height is None:
         return ""
     return f"{frame.width} x {frame.height}"
+
+
+def _lock_panel_width(panel: QWidget, width: int) -> None:
+    panel.setMinimumWidth(width)
+    panel.setMaximumWidth(width)
+    panel.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
 
 
 def _import_status_text(imported: int, skipped: int) -> str:

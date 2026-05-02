@@ -49,6 +49,7 @@ class FitsViewer(QGraphicsView):
         self._pixmap_cache: OrderedDict[tuple[Path, bool, float, float], QPixmap] = OrderedDict()
         self._cache_bytes = 0
         self._max_cache_bytes = 240 * 1024 * 1024
+        self.on_frame_step: Any | None = None
 
     @property
     def current_path(self) -> Path | None:
@@ -203,12 +204,15 @@ class FitsViewer(QGraphicsView):
         self.scale(factor, factor)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
-        if event.key() in {
-            Qt.Key.Key_Left,
-            Qt.Key.Key_Right,
-            Qt.Key.Key_Up,
-            Qt.Key.Key_Down,
-        }:
+        if event.key() == Qt.Key.Key_Left and callable(self.on_frame_step):
+            self.on_frame_step(-1)
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Right and callable(self.on_frame_step):
+            self.on_frame_step(1)
+            event.accept()
+            return
+        if event.key() in {Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down}:
             event.ignore()
             return
         super().keyPressEvent(event)

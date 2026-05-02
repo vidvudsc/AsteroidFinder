@@ -4,12 +4,16 @@ from pathlib import Path
 import os
 
 import numpy as np
+from PySide6.QtCore import QEvent, Qt
+from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import QApplication
 
 from asteroidfinder.io import save_fits
 from asteroidfinder.known_objects import KnownObject
 from asteroidfinder_desktop.main_window import (
+    ANALYSIS_PANEL_WIDTH,
     MainWindow,
+    WORKFLOW_PANEL_WIDTH,
     _frame_match_key,
     _image_metadata,
     _import_status_text,
@@ -18,7 +22,7 @@ from asteroidfinder_desktop.main_window import (
     _progress_bar_text,
 )
 from asteroidfinder_desktop.session import FrameInfo, SessionState, discover_fits_files, filter_image_files, load_session, save_session
-from asteroidfinder_desktop.viewer import _display_luminance
+from asteroidfinder_desktop.viewer import FitsViewer, _display_luminance
 
 
 def test_discover_fits_files_only_returns_supported_images(tmp_path: Path) -> None:
@@ -144,6 +148,53 @@ def test_progress_bar_text_compacts_long_filenames() -> None:
     assert text.endswith(" - %p%")
     assert len(text) < 72
     assert "..." in text
+
+
+def test_frame_step_preserves_view_by_default(monkeypatch: object) -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.session.frames = [
+        FrameInfo(path="first.fit"),
+        FrameInfo(path="second.fit"),
+    ]
+    calls = []
+
+    def fake_show_frame(index: int, *, keep_view: bool = True) -> None:
+        calls.append((index, keep_view))
+
+    monkeypatch.setattr(window, "_show_frame", fake_show_frame)
+
+    window._step_frame(1)
+
+    assert calls == [(1, True)]
+
+
+def test_main_sidebars_have_stable_widths() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    splitter = window.centralWidget()
+    workflow_panel = splitter.widget(0)
+    analysis_panel = splitter.widget(2)
+
+    assert workflow_panel.minimumWidth() == WORKFLOW_PANEL_WIDTH
+    assert workflow_panel.maximumWidth() == WORKFLOW_PANEL_WIDTH
+    assert analysis_panel.minimumWidth() == ANALYSIS_PANEL_WIDTH
+    assert analysis_panel.maximumWidth() == ANALYSIS_PANEL_WIDTH
+
+
+def test_viewer_left_right_arrow_keys_step_frames() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    app = QApplication.instance() or QApplication([])
+    viewer = FitsViewer()
+    steps = []
+    viewer.on_frame_step = steps.append
+
+    viewer.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Right, Qt.KeyboardModifier.NoModifier))
+    viewer.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Left, Qt.KeyboardModifier.NoModifier))
+
+    assert steps == [1, -1]
 
 
 def _known_object(frame: Path) -> KnownObject:
