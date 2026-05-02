@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 from PySide6.QtCore import QRectF, Qt
-from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPen, QPixmap, QWheelEvent
+from PySide6.QtGui import QBrush, QColor, QImage, QKeyEvent, QPainter, QPen, QPixmap, QWheelEvent
 from PySide6.QtWidgets import QGraphicsEllipseItem, QGraphicsPixmapItem, QGraphicsScene, QGraphicsTextItem, QGraphicsView
 
 from asteroidfinder.io import load_image, stretch_to_uint8
@@ -201,6 +201,17 @@ class FitsViewer(QGraphicsView):
             return
         self._zoom = next_zoom
         self.scale(factor, factor)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() in {
+            Qt.Key.Key_Left,
+            Qt.Key.Key_Right,
+            Qt.Key.Key_Up,
+            Qt.Key.Key_Down,
+        }:
+            event.ignore()
+            return
+        super().keyPressEvent(event)
 
     def _render_current(self, *, keep_view: bool) -> None:
         if self._current_data is None:

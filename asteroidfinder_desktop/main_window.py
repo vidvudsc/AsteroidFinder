@@ -80,6 +80,7 @@ class MainWindow(QMainWindow):
         self._diagnostic_windows: list[QDialog] = []
         self._report_windows: list[QDialog] = []
         self._qa_windows: list[QDialog] = []
+        self._known_object_windows: list[QDialog] = []
         self.tracks: list[Track] = []
         self.known_objects: list[KnownObject] = []
         self.track_known_matches: dict[int, str] = {}
@@ -300,6 +301,7 @@ class MainWindow(QMainWindow):
         known_action.toggled.connect(self.show_known_objects.setChecked)
         self.show_known_objects.toggled.connect(known_action.setChecked)
         view_menu.addAction(known_action)
+        view_menu.addAction("Known Object Info", self.open_known_objects_window)
         view_menu.addSeparator()
         view_menu.addAction("Previous Frame", lambda: self._step_frame(-1))
         view_menu.addAction("Next Frame", lambda: self._step_frame(1))
@@ -316,6 +318,7 @@ class MainWindow(QMainWindow):
 
         analysis_menu = self.menuBar().addMenu("Analysis")
         analysis_menu.addAction("Open Movement Chart", self.open_or_generate_movement_graph)
+        analysis_menu.addAction("Open Known Object Info", self.open_known_objects_window)
         analysis_menu.addAction("Open Hot Pixel QA", self.open_hot_pixel_qa)
         analysis_menu.addAction("Open Alignment QA", self.open_alignment_qa)
         analysis_menu.addAction("Write PNG Diagnostics", self.write_png_diagnostics)
@@ -368,7 +371,14 @@ class MainWindow(QMainWindow):
     def _wire_actions(self) -> None:
         self.blink_slider.valueChanged.connect(lambda _: self._blink_timer.setInterval(self._blink_interval_ms()))
         self._space_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
+        self._space_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
         self._space_shortcut.activated.connect(self.toggle_blink)
+        self._previous_frame_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Left), self)
+        self._previous_frame_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        self._previous_frame_shortcut.activated.connect(lambda: self._step_frame(-1))
+        self._next_frame_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Right), self)
+        self._next_frame_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        self._next_frame_shortcut.activated.connect(lambda: self._step_frame(1))
 
     def import_images(self) -> None:
         image_suffixes = " ".join(f"*{suffix}" for suffix in sorted(IMAGE_EXTENSIONS))
@@ -526,6 +536,15 @@ class MainWindow(QMainWindow):
 
     def open_report_window(self) -> None:
         self._start_worker("report", generate_html_report, self._output_dir())
+
+    def open_known_objects_window(self) -> None:
+        if not self.known_objects:
+            self._error("No known objects", "Run Identify Known before opening known-object info.")
+            return
+        window = KnownObjectsWindow(self.known_objects, parent=self)
+        window.destroyed.connect(lambda *_: self._forget_known_object_window(window))
+        self._known_object_windows.append(window)
+        window.show()
 
     def run_full_workflow(self) -> None:
         paths = self._require_paths()
@@ -860,6 +879,10 @@ class MainWindow(QMainWindow):
     def _forget_diagnostic_window(self, window: QDialog) -> None:
         if window in self._diagnostic_windows:
             self._diagnostic_windows.remove(window)
+
+    def _forget_known_object_window(self, window: QDialog) -> None:
+        if window in self._known_object_windows:
+            self._known_object_windows.remove(window)
 
     def _open_report_dialog(self, path: Path) -> None:
         window = ReportWindow(path, parent=self)
@@ -1990,6 +2013,45 @@ class ImageDiagnosticWindow(QDialog):
         self._update_preview()
 
 
+class KnownObjectsWindow(QDialog):
+    def __init__(self, objects: list[KnownObject], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.objects = objects
+        self.setWindowTitle("Known Objects")
+        self.resize(1180, 720)
+        layout = QVBoxLayout(self)
+        summary = QLabel(f"{len(objects)} known object prediction(s)")
+        summary.setObjectName("MutedText")
+        layout.addWidget(summary)
+        rows = [_known_object_row(obj) for obj in objects]
+        self.table = _table_widget(rows)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        layout.addWidget(self.table, 1)
+        controls = QHBoxLayout()
+        copy_button = QPushButton("Copy Selected")
+        copy_button.clicked.connect(self._copy_selected)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.close)
+        controls.addStretch(1)
+        controls.addWidget(copy_button)
+        controls.addWidget(close_button)
+        layout.addLayout(controls)
+
+    def _copy_selected(self) -> None:
+        rows = sorted({index.row() for index in self.table.selectedIndexes()})
+        if not rows:
+            return
+        headers = [self.table.horizontalHeaderItem(column).text() for column in range(self.table.columnCount())]
+        lines = ["\t".join(headers)]
+        for row in rows:
+            values = []
+            for column in range(self.table.columnCount()):
+                item = self.table.item(row, column)
+                values.append("" if item is None else item.text())
+            lines.append("\t".join(values))
+        QApplication.clipboard().setText("\n".join(lines))
+
+
 class ReportWindow(QDialog):
     def __init__(self, path: Path, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -2174,6 +2236,30 @@ def _read_csv_file(path: Path) -> list[dict[str, str]]:
         return []
     with path.open(newline="") as handle:
         return list(csv.DictReader(handle))
+
+
+def _known_object_row(obj: KnownObject) -> dict[str, str]:
+    return {
+        "Frame": obj.frame.name,
+        "Date": obj.date_obs,
+        "Number": obj.number,
+        "Name": obj.name,
+        "Type": obj.object_type,
+        "RA deg": _format_optional_float(obj.ra_deg, 7),
+        "Dec deg": _format_optional_float(obj.dec_deg, 7),
+        "X": _format_optional_float(obj.x, 2),
+        "Y": _format_optional_float(obj.y, 2),
+        "V mag": _format_optional_float(obj.v_mag, 2),
+        "Center arcsec": _format_optional_float(obj.center_distance_arcsec, 1),
+        "RA rate arcsec/hr": _format_optional_float(obj.ra_rate_arcsec_per_hour, 3),
+        "Dec rate arcsec/hr": _format_optional_float(obj.dec_rate_arcsec_per_hour, 3),
+    }
+
+
+def _format_optional_float(value: float | None, digits: int) -> str:
+    if value is None:
+        return ""
+    return f"{float(value):.{digits}f}"
 
 
 def _table_widget(rows: list[dict[str, str]]) -> QTableWidget:

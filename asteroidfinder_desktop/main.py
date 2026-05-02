@@ -24,8 +24,11 @@ def main() -> int:
 
     from .main_window import MainWindow, apply_dark_theme
 
+    _set_native_process_name("AsteroidFinder")
     app = QApplication(sys.argv)
     app.setApplicationName("AsteroidFinder")
+    app.setApplicationDisplayName("AsteroidFinder")
+    app.setOrganizationName("AsteroidFinder")
     icon = QIcon(str(files("asteroidfinder_desktop").joinpath("assets/icon.png")))
     app.setWindowIcon(icon)
     apply_dark_theme(app)
@@ -34,3 +37,14 @@ def main() -> int:
     window.resize(1360, 860)
     window.show()
     return app.exec()
+
+
+def _set_native_process_name(name: str) -> None:
+    if sys.platform != "darwin":
+        return
+    try:
+        from Foundation import NSProcessInfo
+
+        NSProcessInfo.processInfo().setProcessName_(name)
+    except Exception:
+        pass
