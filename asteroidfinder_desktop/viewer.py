@@ -36,7 +36,7 @@ class FitsViewer(QGraphicsView):
         self._header_cache: OrderedDict[Path, Any | None] = OrderedDict()
         self._pixmap_cache: OrderedDict[tuple[Path, bool, float, float], QPixmap] = OrderedDict()
         self._cache_bytes = 0
-        self._max_cache_bytes = 768 * 1024 * 1024
+        self._max_cache_bytes = 240 * 1024 * 1024
 
     @property
     def current_path(self) -> Path | None:
@@ -67,6 +67,12 @@ class FitsViewer(QGraphicsView):
         self.percentile_low = low
         self.percentile_high = high
         self._render_current(keep_view=True)
+
+    def clear_cache(self) -> None:
+        self._data_cache.clear()
+        self._header_cache.clear()
+        self._pixmap_cache.clear()
+        self._cache_bytes = 0
 
     def clear_overlays(self) -> None:
         for item in self._overlay_items:
@@ -231,7 +237,7 @@ class FitsViewer(QGraphicsView):
             for key in list(self._pixmap_cache):
                 if key[0] == path:
                     self._pixmap_cache.pop(key, None)
-        while len(self._pixmap_cache) > max(len(self._data_cache) * 4, 8):
+        while len(self._pixmap_cache) > 4:
             self._pixmap_cache.popitem(last=False)
 
 

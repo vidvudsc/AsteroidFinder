@@ -8,6 +8,7 @@ from time import perf_counter
 import webbrowser
 
 import numpy as np
+from astropy.io import fits
 from astropy.wcs import WCS
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
@@ -391,6 +392,8 @@ class MainWindow(QMainWindow):
         skipped = selected_count - len(paths)
         self.input_edit.setText(_import_status_text(len(paths), skipped))
         self.output_edit.setText(self.session.output_dir)
+        self.viewer.clear_cache()
+        self._plate_info_cache.clear()
         self.session.frames = [self._frame_info(path) for path in paths]
         self._populate_frames()
         self._log(_import_status_text(len(paths), skipped))
@@ -1009,7 +1012,7 @@ class MainWindow(QMainWindow):
         skipped: list[tuple[Path, str]] = []
         for path in paths:
             try:
-                load_image(path)
+                _image_metadata(path)
             except Exception as exc:
                 skipped.append((path, str(exc)))
                 continue
@@ -1050,7 +1053,7 @@ class MainWindow(QMainWindow):
         groups: dict[tuple[int, int], list[Path]] = {}
         for path in paths:
             try:
-                shape = load_image(path).data.shape
+                shape, _ = _image_metadata(path)
             except Exception:
                 shape = (-1, -1)
             groups.setdefault(shape, []).append(path)
@@ -1080,19 +1083,18 @@ class MainWindow(QMainWindow):
 
     def _frame_info(self, path: Path) -> FrameInfo:
         try:
-            image = load_image(path)
-            header = image.header
+            shape, header = _image_metadata(path)
             has_wcs = False
             if header is not None:
                 try:
                     has_wcs = WCS(header).has_celestial
                 except Exception:
                     has_wcs = False
-            self._plate_info_cache[path] = _plate_info_for(path, image.data.shape, header)
+            self._plate_info_cache[path] = _plate_info_for(path, shape, header)
             return FrameInfo(
                 path=str(path),
-                width=int(image.data.shape[1]),
-                height=int(image.data.shape[0]),
+                width=int(shape[1]),
+                height=int(shape[0]),
                 date_obs=None if header is None else str(header.get("DATE-OBS", "")) or None,
                 filter_name=None if header is None else str(header.get("FILTER", "")) or None,
                 has_wcs=has_wcs,
@@ -1120,8 +1122,8 @@ class MainWindow(QMainWindow):
             self._set_plate_info(*cached)
             return
         try:
-            image = load_image(path)
-            info = _plate_info_for(path, image.data.shape, image.header)
+            shape, header = _image_metadata(path)
+            info = _plate_info_for(path, shape, header)
             self._plate_info_cache[path] = info
             self._set_plate_info(*info)
         except Exception as exc:
@@ -1368,6 +1370,46 @@ def _pixel_scale_arcsec(wcs: WCS) -> float | None:
         return float(sum(abs(value) for value in scales) / len(scales))
     except Exception:
         return None
+
+
+def _image_metadata(path: Path) -> tuple[tuple[int, int], fits.Header | None]:
+    suffix = path.suffix.lower()
+    if suffix in FITS_EXTENSIONS:
+        if not path.exists() or path.stat().st_size == 0:
+            raise ValueError("Empty FITS file")
+        with fits.open(path, memmap=True, do_not_scale_image_data=True) as hdul:
+            for hdu in hdul:
+                header = hdu.header.copy()
+                shape = _display_shape_from_header(header)
+                if shape is not None:
+                    return shape, header
+        raise ValueError("No image data found in FITS file")
+    if suffix in IMAGE_EXTENSIONS:
+        with PILImage.open(path) as image:
+            width, height = image.size
+        return (int(height), int(width)), None
+    raise ValueError(f"Unsupported image format: {path}")
+
+
+def _display_shape_from_header(header: fits.Header) -> tuple[int, int] | None:
+    naxis = int(header.get("NAXIS", 0) or 0)
+    if naxis < 2:
+        return None
+    width = int(header.get("NAXIS1", 0) or 0)
+    height = int(header.get("NAXIS2", 0) or 0)
+    if width <= 0 or height <= 0:
+        return None
+    if naxis == 2:
+        return (height, width)
+    depth = int(header.get("NAXIS3", 0) or 0)
+    if depth in {3, 4}:
+        return (height, width)
+    if width in {3, 4} and depth > 0:
+        return (depth, height)
+    raise ValueError(
+        "Unsupported FITS cube shape from header: "
+        f"NAXIS1={width}, NAXIS2={height}, NAXIS3={depth}"
+    )
 
 
 def _plate_info_for(path: Path, shape: tuple[int, ...], header: object | None) -> tuple[str, str, str, str]:
