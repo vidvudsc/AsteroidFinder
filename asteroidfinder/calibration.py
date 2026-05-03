@@ -8,7 +8,7 @@ import csv
 import numpy as np
 from astropy.io import fits
 from PIL import Image
-from scipy.ndimage import maximum_filter, median_filter
+from scipy.ndimage import maximum_filter, median_filter, minimum_filter
 
 from .io import AstroImage, load_image, save_fits
 
@@ -351,8 +351,9 @@ def detect_isolated_hot_pixels(
     neighbor_sigma: float = 6.0,
     min_center_neighbor_ratio: float = 2.0,
     filter_size: int = 3,
+    include_cold: bool = True,
 ) -> np.ndarray:
-    """Detect isolated hot-pixel candidates without replacing them."""
+    """Detect isolated bright hot pixels and dark dead pixels."""
 
     image = np.asarray(data, dtype=np.float32)
     local = median_filter(image, size=filter_size)
@@ -368,6 +369,7 @@ def detect_isolated_hot_pixels(
         sigma=sigma,
         neighbor_sigma=neighbor_sigma,
         min_center_neighbor_ratio=min_center_neighbor_ratio,
+        include_cold=include_cold,
     )
 
 
@@ -380,6 +382,7 @@ def _isolated_hot_pixel_mask(
     sigma: float,
     neighbor_sigma: float,
     min_center_neighbor_ratio: float,
+    include_cold: bool = True,
 ) -> np.ndarray:
 
     footprint = np.ones((3, 3), dtype=bool)
@@ -389,7 +392,17 @@ def _isolated_hot_pixel_mask(
     bright_center = residual > sigma * robust_sigma
     quiet_neighbors = neighbor_residual < neighbor_sigma * robust_sigma
     isolated_contrast = image / np.maximum(neighbor_max, 1.0) >= min_center_neighbor_ratio
-    return bright_center & quiet_neighbors & isolated_contrast
+    hot = bright_center & quiet_neighbors & isolated_contrast
+    if not include_cold:
+        return hot
+
+    neighbor_min = minimum_filter(image, footprint=footprint, mode="nearest")
+    cold_residual = local - image
+    cold_neighbor_residual = local - neighbor_min
+    cold_center = cold_residual > sigma * robust_sigma
+    quiet_cold_neighbors = cold_neighbor_residual < neighbor_sigma * robust_sigma
+    isolated_dark_contrast = cold_residual / np.maximum(np.abs(local), 1.0) >= 0.35
+    return hot | (cold_center & quiet_cold_neighbors & isolated_dark_contrast)
 
 
 def apply_hot_pixel_mask(data: np.ndarray, mask: np.ndarray, *, filter_size: int = 3) -> np.ndarray:

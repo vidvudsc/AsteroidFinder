@@ -85,6 +85,43 @@ def test_plate_solver_uses_2d_input_and_header_hints(tmp_path: Path, monkeypatch
     assert "--objs" in cmd and "200" in cmd
 
 
+def test_plate_solver_missing_solution_error_recommends_indexes(tmp_path: Path, monkeypatch) -> None:
+    from asteroidfinder import platesolve
+
+    path = tmp_path / "narrow.fit"
+    header = fits.Header()
+    header["RA"] = "21 45 00.00"
+    header["DEC"] = "-15 00 00.0"
+    header["FOCALLEN"] = 2262.0
+    header["XPIXSZ"] = 9.0
+    header["XBINNING"] = 1
+    fits.writeto(path, np.zeros((2048, 3072), dtype=np.float32), header)
+    index_dir = tmp_path / "indexes"
+    index_dir.mkdir()
+    (index_dir / "index-4210.fits").write_bytes(b"")
+
+    def fake_run(cmd, **kwargs):
+        out_dir = Path(cmd[cmd.index("--dir") + 1])
+        Path(cmd[-1]).with_suffix(".axy").write_bytes(b"axy")
+        return platesolve.subprocess.CompletedProcess(cmd, 0, stdout="Field 1 did not solve.", stderr="")
+
+    monkeypatch.setattr(platesolve.shutil, "which", lambda name: "/usr/bin/solve-field")
+    monkeypatch.setattr(platesolve.subprocess, "run", fake_run)
+
+    try:
+        platesolve.solve_image(path, output_dir=tmp_path / "solved", index_dir=index_dir, timeout=30)
+    except RuntimeError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("solve_image should fail when astrometry produces no .new file")
+
+    assert "did not find an astrometric solution" in message
+    assert "narrow-solveinput.axy" in message
+    assert "recommended 4200-series indexes" in message
+    assert "4206, 4207, 4208" in message
+    assert "Installed/visible index series: 4210" in message
+
+
 def test_detect_sources_finds_synthetic_stars() -> None:
     image = np.zeros((100, 100), dtype=np.float32)
     yy, xx = np.indices(image.shape)
@@ -108,6 +145,22 @@ def test_hot_pixel_cleanup_replaces_isolated_spike() -> None:
 
     assert mask[10, 10]
     assert cleaned[10, 10] == 100
+
+
+def test_persistent_hot_pixel_mask_detects_dead_pixel(tmp_path: Path) -> None:
+    paths = []
+    for frame in range(4):
+        image = np.full((21, 21), 1000, dtype=np.float32)
+        image[7, 11] = 0
+        path = tmp_path / f"dead_{frame}.fits"
+        save_fits(image, path)
+        paths.append(path)
+
+    mask = build_persistent_hot_pixel_mask(paths, sigma=8, neighbor_sigma=4, min_center_neighbor_ratio=2, min_frames=3)
+    results = calibrate_images_with_persistent_hot_pixels(paths, hot_sigma=8, neighbor_sigma=4, min_center_neighbor_ratio=2, min_frames=3)
+
+    assert mask[7, 11]
+    assert all(result.data[7, 11] == 1000 for result in results)
 
 
 def test_persistent_hot_pixel_mask_does_not_flag_moving_star(tmp_path: Path) -> None:
@@ -365,6 +418,12 @@ def test_doctor_reports_index_recommendation(tmp_path: Path) -> None:
 
     assert any(check.name == "astrometry index files" and check.ok for check in checks)
     assert series == ["4210", "4211", "4212"]
+
+
+def test_doctor_recommends_split_indexes_for_t30_scale() -> None:
+    series = recommend_index_series(image_width_px=3072, scale_low=0.701, scale_high=0.948)
+
+    assert series == ["4206", "4207", "4208"]
 
 
 def test_known_object_time_fallback_accepts_obsjd() -> None:

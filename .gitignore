@@ -6,6 +6,7 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
+*.egg-info/
 
 # macOS / editor
 .DS_Store
@@ -17,6 +18,7 @@ demo/output/
 demo2/output/
 runs/
 outputs/
+dist/
 *.fit
 *.fits
 *.fts

@@ -13,6 +13,7 @@ from astropy.coordinates import SkyCoord
 from astropy.io import fits
 from astropy.wcs import WCS
 
+from .doctor import recommend_index_series
 from .io import load_image, save_fits
 
 
@@ -122,7 +123,7 @@ def _solve_with_astrometry_net(
     cmd.extend(["--crpix-center", "--no-tweak"])
     cmd.append(str(working_input))
     try:
-        subprocess.run(cmd, check=True, timeout=timeout + 30, capture_output=True, text=True)
+        completed = subprocess.run(cmd, check=True, timeout=timeout + 30, capture_output=True, text=True)
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(
             f"astrometry.net solve-field timed out after {timeout + 30} seconds for {path}. "
@@ -135,7 +136,19 @@ def _solve_with_astrometry_net(
 
     solved_path = out_dir / f"{working_input.stem}.new"
     if not solved_path.exists():
-        raise RuntimeError(f"astrometry.net completed without producing a solved FITS file: {solved_path}")
+        raise RuntimeError(
+            _missing_solution_message(
+                path=path,
+                solved_path=solved_path,
+                out_dir=out_dir,
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+                shape=image.data.shape,
+                scale_low=scale_low,
+                scale_high=scale_high,
+                index_dir=index_dir,
+            )
+        )
     header = fits.getheader(solved_path)
     wcs = WCS(header)
     if not wcs.has_celestial:
@@ -182,6 +195,51 @@ def _search_radius_for_image(shape: tuple[int, ...], scale_high_arcsec_per_pixel
     height, width = shape[-2], shape[-1]
     diagonal_deg = float(np.hypot(width, height) * scale_high_arcsec_per_pixel / 3600.0)
     return max(1.0, min(8.0, diagonal_deg * 1.25))
+
+
+def _missing_solution_message(
+    *,
+    path: Path,
+    solved_path: Path,
+    out_dir: Path,
+    stdout: str | None,
+    stderr: str | None,
+    shape: tuple[int, ...],
+    scale_low: float | None,
+    scale_high: float | None,
+    index_dir: str | Path | None,
+) -> str:
+    produced = ", ".join(sorted(item.name for item in out_dir.glob(f"{solved_path.stem}.*"))) or "none"
+    details = "\n".join(part.strip() for part in (stdout, stderr) if part and part.strip())
+    details = textwrap.shorten(details.replace("\n", " "), width=1200, placeholder=" ...") if details else "no solve-field output"
+    hint = ""
+    if scale_low is not None and scale_high is not None and len(shape) >= 2:
+        width = max(shape[-2], shape[-1])
+        series = ", ".join(recommend_index_series(image_width_px=width, scale_low=scale_low, scale_high=scale_high))
+        installed = _installed_index_series(index_dir)
+        installed_text = ", ".join(installed) if installed else "none found"
+        hint = (
+            f" Inferred scale is {scale_low:.3f}-{scale_high:.3f} arcsec/pixel; "
+            f"recommended 4200-series indexes for this field are {series}. "
+            f"Installed/visible index series: {installed_text}."
+        )
+    return (
+        "astrometry.net did not find an astrometric solution for "
+        f"{path}; expected solved FITS file {solved_path}. "
+        f"Produced files: {produced}.{hint} solve-field output: {details}"
+    )
+
+
+def _installed_index_series(index_dir: str | Path | None) -> list[str]:
+    if index_dir is None:
+        return []
+    directory = Path(index_dir).expanduser()
+    series = set()
+    for path in list(directory.glob("index-*.fits")) + list(directory.glob("index-*.fits.fz")):
+        name = path.name
+        if name.startswith("index-"):
+            series.add(name.removeprefix("index-").split(".")[0].split("-")[0])
+    return sorted(series)
 
 
 def _optional_float(value: object) -> float | None:

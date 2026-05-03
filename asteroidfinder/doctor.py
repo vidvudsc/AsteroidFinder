@@ -12,6 +12,11 @@ from .io import load_image
 
 
 ASTROMETRY_INDEX_URL = "https://data.astrometry.net/4200/"
+_SPLIT_INDEX_COUNTS = {
+    "4205": 12,
+    "4206": 12,
+    "4207": 12,
+}
 
 
 @dataclass(frozen=True)
@@ -88,28 +93,35 @@ def recommend_index_series(
     if field_mid_deg >= 1.0:
         return ["4210", "4211", "4212"]
     if field_mid_deg >= 0.4:
-        return ["4208", "4209", "4210"]
-    if field_mid_deg >= 0.15:
         return ["4206", "4207", "4208"]
-    return ["4204", "4205", "4206"]
+    if field_mid_deg >= 0.15:
+        return ["4204", "4205", "4206"]
+    return ["4202", "4203", "4204"]
 
 
 def install_astrometry_indexes(series: list[str], index_dir: str | Path) -> list[Path]:
-    """Download single-file 4200-series index files when available."""
+    """Download 4200-series index files, including split healpix series."""
 
     out_dir = Path(index_dir).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
     for item in series:
-        filename = f"index-{item}.fits"
-        dest = out_dir / filename
-        if dest.exists():
+        for filename in _index_filenames(item):
+            dest = out_dir / filename
+            if dest.exists():
+                written.append(dest)
+                continue
+            url = f"{ASTROMETRY_INDEX_URL}{filename}"
+            subprocess.run(["curl", "-L", "--fail", "-C", "-", "-o", str(dest), url], check=True)
             written.append(dest)
-            continue
-        url = f"{ASTROMETRY_INDEX_URL}{filename}"
-        subprocess.run(["curl", "-L", "--fail", "-C", "-", "-o", str(dest), url], check=True)
-        written.append(dest)
     return written
+
+
+def _index_filenames(series: str) -> list[str]:
+    count = _SPLIT_INDEX_COUNTS.get(series)
+    if count is None:
+        return [f"index-{series}.fits"]
+    return [f"index-{series}-{index:02d}.fits" for index in range(count)]
 
 
 def _find_index_files(index_dir: str | Path | None) -> list[Path]:
