@@ -12,10 +12,10 @@ from astropy.io import fits
 from astropy.wcs import WCS
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
-from PySide6.QtCore import QThreadPool, QTimer, Qt
+from PySide6.QtCore import QRectF, QThreadPool, QTimer, Qt
 from PIL import Image as PILImage
 from PIL import ImageOps
-from PySide6.QtGui import QAction, QColor, QImage, QKeySequence, QPalette, QPixmap, QShortcut
+from PySide6.QtGui import QAction, QColor, QImage, QKeySequence, QPalette, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGraphicsEllipseItem,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -35,7 +36,6 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
-    QSizePolicy,
     QSlider,
     QSpinBox,
     QSplitter,
@@ -53,7 +53,7 @@ from asteroidfinder.calibration import calibrate_images_with_persistent_hot_pixe
 from asteroidfinder.diagnostics import plot_track_diagnostics
 from asteroidfinder.io import load_image
 from asteroidfinder.known_objects import KnownObject, query_known_objects_with_motion_cache, write_known_objects_csv
-from asteroidfinder.mpc import write_detected_track_mpc
+from asteroidfinder.mpc import write_detected_track_ades, write_detected_track_mpc
 from asteroidfinder.platesolve import solve_image
 from asteroidfinder.report import generate_html_report
 from asteroidfinder.tracking import Track, track_moving_objects
@@ -64,8 +64,33 @@ from .viewer import FitsViewer, PreparedDisplayFrame, prepare_display_frame
 from .workers import FunctionWorker
 
 
-WORKFLOW_PANEL_WIDTH = 320
 ANALYSIS_PANEL_WIDTH = 380
+WORKFLOW_PANEL_WIDTH = 320
+
+
+class WorkflowStepDialog(QDialog):
+    """Small dialog that shows relevant settings for a single workflow step."""
+
+    def __init__(self, title: str, fields: list[tuple[str, QWidget]], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(340)
+        layout = QVBoxLayout(self)
+        if fields:
+            form = QFormLayout()
+            for label, widget in fields:
+                form.addRow(label, widget)
+            layout.addLayout(form)
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        self.run_button = QPushButton("Run")
+        self.run_button.setDefault(True)
+        self.run_button.clicked.connect(self.accept)
+        button_row.addWidget(cancel)
+        button_row.addWidget(self.run_button)
+        layout.addLayout(button_row)
 
 
 class MainWindow(QMainWindow):
@@ -120,27 +145,11 @@ class MainWindow(QMainWindow):
         self.plate_path = QLabel("")
         self.plate_path.setWordWrap(True)
 
-        self.input_edit = QLineEdit()
-        self.input_edit.setReadOnly(True)
-        self.output_edit = QLineEdit()
-        self.index_edit = QLineEdit(self.session.settings.index_dir)
-        self.scale_low = _optional_double_spin()
-        self.scale_high = _optional_double_spin()
-        self.solve_timeout = QSpinBox()
-        self.solve_timeout.setRange(30, 1800)
-        self.solve_timeout.setSingleStep(30)
-        self.solve_timeout.setValue(300)
-        self.solve_timeout.setToolTip("Maximum astrometry.net solve-field time per image, in seconds.")
-        self.hot_sigma = _double_spin(self.session.settings.hot_sigma, 0.0, 50.0, 0.5)
-        self.detect_sigma = _double_spin(self.session.settings.detect_sigma, 1.0, 20.0, 0.25)
-        self.min_detections = QSpinBox()
-        self.min_detections.setRange(2, 20)
-        self.min_detections.setValue(self.session.settings.min_detections)
-        self.observatory_code = QLineEdit(self.session.settings.observatory_code)
-        self.alignment_output = QComboBox()
-        self.alignment_output.addItem("Crop clean overlap", True)
-        self.alignment_output.addItem("Keep reference canvas", False)
-        self.alignment_output.setToolTip("Crop removes black no-data borders after alignment. Keep reference canvas is better for debugging.")
+        self._workflow_done: dict[str, bool] = {}
+        self._workflow_actions: dict[str, QAction] = {}
+        self.path_label = QLabel("No images loaded")
+        self.path_label.setObjectName("MutedText")
+        self.path_label.setToolTip("Click a workflow step to begin")
         self.show_full_track = QCheckBox("Show full track")
         self.show_full_track.setToolTip("Off shows one circle on the current frame. On shows every detection and the motion line.")
         self.show_full_track.toggled.connect(lambda _: self._draw_checked_tracks())
@@ -151,6 +160,7 @@ class MainWindow(QMainWindow):
         self.blink_slider = QSlider(Qt.Orientation.Horizontal)
         self.blink_slider.setRange(1, 20)
         self.blink_slider.setValue(15)
+        self.blink_slider.setFixedWidth(92)
         self.blink_slider.setToolTip("Blink speed: left is slower, right is faster")
 
         self._build_ui()
@@ -171,98 +181,38 @@ class MainWindow(QMainWindow):
         save_action.setShortcut("Meta+S")
         save_action.triggered.connect(self.save_session_file)
         toolbar.addAction(save_action)
+        toolbar.addSeparator()
 
-        root = QSplitter(Qt.Orientation.Horizontal)
-        root.addWidget(self._workflow_panel())
-        root.addWidget(self._center_panel())
-        root.addWidget(self._analysis_panel())
-        root.setStretchFactor(0, 0)
-        root.setStretchFactor(1, 1)
-        root.setStretchFactor(2, 0)
-        self.setCentralWidget(root)
-
-    def _workflow_panel(self) -> QWidget:
-        panel = QWidget()
-        panel.setObjectName("SidePanel")
-        _lock_panel_width(panel, WORKFLOW_PANEL_WIDTH)
-        layout = QVBoxLayout(panel)
-
-        browse_output = QPushButton("Output")
-        browse_output.clicked.connect(self.choose_output_folder)
-
-        layout.addWidget(QLabel("Input Images"))
-        layout.addWidget(self.input_edit)
-
-        out_row = QHBoxLayout()
-        out_row.addWidget(self.output_edit)
-        out_row.addWidget(browse_output)
-        layout.addWidget(QLabel("Output Folder"))
-        layout.addLayout(out_row)
-
-        workflow_box = QGroupBox("Workflow")
-        workflow_layout = QVBoxLayout(workflow_box)
-        workflow_layout.setContentsMargins(10, 10, 10, 10)
-        workflow_layout.setSpacing(5)
-        for label, handler in [
-            ("Clean Hot Pixels", self.run_calibration),
-            ("Plate Solve", self.run_plate_solve),
-            ("Align Stars", self.run_alignment),
-            ("Detect Movers", self.run_tracking),
-            ("Identify Known", self.query_known_objects),
-            ("Export MPC", self.export_mpc),
-            ("Report", self.open_report_window),
+        for key, label, handler in [
+            ("calibration", "Calibrate", self._open_calibration_dialog),
+            ("plate solve", "Solve", self._open_plate_solve_dialog),
+            ("alignment", "Align", self._open_alignment_dialog),
+            ("tracking", "Detect", self._open_tracking_dialog),
+            ("known objects", "Known", self._open_known_objects_dialog),
+            ("MPC export", "Export", self._open_export_dialog),
+            ("report", "Report", self.open_report_window),
         ]:
-            button = QPushButton(label)
-            button.setObjectName("WorkflowButton")
-            button.setFixedHeight(30)
-            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            button.clicked.connect(handler)
-            workflow_layout.addWidget(button)
-        layout.addWidget(workflow_box)
+            action = QAction(label, self)
+            action.triggered.connect(handler)
+            toolbar.addAction(action)
+            self._workflow_actions[key] = action
 
-        settings_box = QGroupBox("Settings")
-        settings = QFormLayout(settings_box)
-        settings.addRow("Index dir", self.index_edit)
-        settings.addRow("Scale low", self.scale_low)
-        settings.addRow("Scale high", self.scale_high)
-        settings.addRow("Solve timeout", self.solve_timeout)
-        settings.addRow("Hot sigma", self.hot_sigma)
-        settings.addRow("Detect sigma", self.detect_sigma)
-        settings.addRow("Min detections", self.min_detections)
-        settings.addRow("Observatory", self.observatory_code)
-        settings.addRow("Alignment output", self.alignment_output)
-        layout.addWidget(settings_box)
+        toolbar.addSeparator()
+        toolbar.addWidget(self.path_label)
 
-        layout.addStretch(1)
-        return panel
+        self._analysis_widget = self._analysis_panel()
+        root = QSplitter(Qt.Orientation.Horizontal)
+        root.addWidget(self._center_panel())
+        root.addWidget(self._analysis_widget)
+        root.setStretchFactor(0, 1)
+        root.setStretchFactor(1, 0)
+        self.setCentralWidget(root)
 
     def _center_panel(self) -> QWidget:
         panel = QWidget()
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(8, 8, 8, 8)
-
-        controls = QHBoxLayout()
-        import_button = QPushButton("Import Images")
-        import_button.clicked.connect(self.import_images)
-        previous = _icon_button("⏮", "Previous frame")
-        previous.clicked.connect(lambda: self._step_frame(-1))
-        self.play_button = _icon_button("▶", "Start blink")
-        self.play_button.clicked.connect(self.toggle_blink)
-        next_button = _icon_button("⏭", "Next frame")
-        next_button.clicked.connect(lambda: self._step_frame(1))
-        fit_button = _icon_button("⛶", "Fit image to view")
-        fit_button.clicked.connect(self.viewer.fit_to_view)
-        self.invert_check.toggled.connect(self.viewer.set_inverted)
-        controls.addWidget(import_button)
-        controls.addStretch(1)
-        controls.addWidget(previous)
-        controls.addWidget(self.play_button)
-        controls.addWidget(next_button)
-        controls.addWidget(fit_button)
-        controls.addWidget(self.invert_check)
-        controls.addWidget(QLabel("Speed"))
-        controls.addWidget(self.blink_slider)
-        layout.addLayout(controls)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(2)
         layout.addWidget(self.viewer, 1)
         progress_row = QHBoxLayout()
         progress_row.addWidget(self.progress_label)
@@ -314,22 +264,37 @@ class MainWindow(QMainWindow):
         view_menu.addAction("Start/Pause Blink", self.toggle_blink)
 
         workflow_menu = self.menuBar().addMenu("Workflow")
-        workflow_menu.addAction("Clean Hot Pixels", self.run_calibration)
-        workflow_menu.addAction("Plate Solve", self.run_plate_solve)
-        workflow_menu.addAction("Align Stars", self.run_alignment)
-        workflow_menu.addAction("Detect Movers", self.run_tracking)
-        workflow_menu.addAction("Identify Known Objects", self.query_known_objects)
+        self._menu_workflow_actions: dict[str, QAction] = {}
+        for key, label, handler in [
+            ("calibration", "Clean Hot Pixels", self._open_calibration_dialog),
+            ("plate solve", "Plate Solve", self._open_plate_solve_dialog),
+            ("alignment", "Align Stars", self._open_alignment_dialog),
+            ("tracking", "Detect Movers", self._open_tracking_dialog),
+            ("known objects", "Identify Known", self._open_known_objects_dialog),
+            ("MPC export", "Export MPC", self._open_export_dialog),
+            ("report", "Report", self.open_report_window),
+        ]:
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.setEnabled(True)
+            action.triggered.connect(lambda checked, h=handler: h())
+            workflow_menu.addAction(action)
+            self._menu_workflow_actions[key] = action
         workflow_menu.addSeparator()
-        workflow_menu.addAction("Run Basic Workflow", self.run_full_workflow)
+        workflow_menu.addAction("Run Full Pipeline", self.run_full_workflow)
 
         analysis_menu = self.menuBar().addMenu("Analysis")
-        analysis_menu.addAction("Open Movement Chart", self.open_or_generate_movement_graph)
-        analysis_menu.addAction("Open Known Object Info", self.open_known_objects_window)
-        analysis_menu.addAction("Open Hot Pixel QA", self.open_hot_pixel_qa)
-        analysis_menu.addAction("Open Alignment QA", self.open_alignment_qa)
-        analysis_menu.addAction("Write PNG Diagnostics", self.write_png_diagnostics)
-        analysis_menu.addAction("Export MPC Observations", self.export_mpc)
-        analysis_menu.addAction("Open Report", self.open_report_window)
+        analysis_menu.addAction("Movement Chart", self.open_or_generate_movement_graph)
+        analysis_menu.addAction("Track Cutouts", self._open_cutout_window)
+        analysis_menu.addAction("Known Object Info", self.open_known_objects_window)
+        analysis_menu.addSeparator()
+        analysis_menu.addAction("Hot Pixel QA", self.open_hot_pixel_qa)
+        analysis_menu.addAction("Alignment QA", self.open_alignment_qa)
+        analysis_menu.addAction("PNG Diagnostics", self.write_png_diagnostics)
+        analysis_menu.addSeparator()
+        analysis_menu.addAction("Export MPC (80-col)", self._open_export_dialog)
+        analysis_menu.addAction("Export ADES (PSV)", self._open_ades_export_dialog)
+        analysis_menu.addAction("Report", self.open_report_window)
 
         help_menu = self.menuBar().addMenu("Help")
         help_menu.addAction("About AsteroidFinder", self._show_about)
@@ -337,8 +302,32 @@ class MainWindow(QMainWindow):
     def _analysis_panel(self) -> QWidget:
         panel = QWidget()
         panel.setObjectName("SidePanel")
-        _lock_panel_width(panel, ANALYSIS_PANEL_WIDTH)
+        panel.setMinimumWidth(ANALYSIS_PANEL_WIDTH)
+        panel.setMaximumWidth(500)
         layout = QVBoxLayout(panel)
+        layout.setSpacing(4)
+
+        blink_row = QHBoxLayout()
+        previous = _icon_button("⏮", "Previous frame")
+        previous.clicked.connect(lambda: self._step_frame(-1))
+        self.play_button = _icon_button("▶", "Start blink")
+        self.play_button.clicked.connect(self.toggle_blink)
+        next_button = _icon_button("⏭", "Next frame")
+        next_button.clicked.connect(lambda: self._step_frame(1))
+        fit_button = _icon_button("⛶", "Fit image to view")
+        fit_button.clicked.connect(self.viewer.fit_to_view)
+        self.invert_check.toggled.connect(self.viewer.set_inverted)
+        blink_row.addWidget(previous)
+        blink_row.addWidget(self.play_button)
+        blink_row.addWidget(next_button)
+        blink_row.addWidget(fit_button)
+        blink_row.addWidget(self.invert_check)
+        blink_row.addStretch(1)
+        speed_label = QLabel("Speed")
+        speed_label.setObjectName("MutedText")
+        blink_row.addWidget(speed_label)
+        blink_row.addWidget(self.blink_slider)
+        layout.addLayout(blink_row)
 
         self.frame_table.setHorizontalHeaderLabels(["Frame", "Time", "Filter", "Size", "WCS"])
         self.frame_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
@@ -349,11 +338,11 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel("Frames"))
         layout.addWidget(self.frame_table, 2)
 
-        plate_box = QGroupBox("Plate Solve")
+        plate_box = QGroupBox("Astrometry")
         plate_layout = QFormLayout(plate_box)
         plate_layout.addRow("Status", self.plate_status)
         plate_layout.addRow("Center", self.plate_center)
-        plate_layout.addRow("Pixel scale", self.plate_scale)
+        plate_layout.addRow("Scale", self.plate_scale)
         plate_layout.addRow("File", self.plate_path)
         layout.addWidget(plate_box)
 
@@ -364,14 +353,24 @@ class MainWindow(QMainWindow):
         self.track_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.track_table.itemSelectionChanged.connect(self._selected_track_changed)
         layout.addWidget(QLabel("Detected Tracks"))
-        layout.addWidget(self.show_full_track)
-        layout.addWidget(self.show_known_objects)
+        overlay_row = QHBoxLayout()
+        overlay_row.addWidget(self.show_full_track)
+        overlay_row.addWidget(self.show_known_objects)
+        self.show_stars = QCheckBox("Stars")
+        self.show_stars.setToolTip("Overlay detected catalog stars from plate solve")
+        self.show_stars.toggled.connect(lambda _: self._draw_checked_tracks())
+        overlay_row.addWidget(self.show_stars)
+        layout.addLayout(overlay_row)
         layout.addWidget(self.track_table, 1)
-        graph_row = QHBoxLayout()
-        graph_button = QPushButton("Open Movement Chart")
+        track_buttons = QHBoxLayout()
+        graph_button = QPushButton("Movement Chart")
         graph_button.clicked.connect(self.open_or_generate_movement_graph)
-        graph_row.addWidget(graph_button)
-        layout.addLayout(graph_row)
+        cutout_button = QPushButton("Cutouts")
+        cutout_button.setToolTip("Show thumbnail cutouts around selected track")
+        cutout_button.clicked.connect(self._open_cutout_window)
+        track_buttons.addWidget(graph_button)
+        track_buttons.addWidget(cutout_button)
+        layout.addLayout(track_buttons)
 
         layout.addWidget(QLabel("Log"))
         layout.addWidget(self.log, 1)
@@ -416,8 +415,7 @@ class MainWindow(QMainWindow):
         self.session.input_dir = str(common_parent)
         self.session.output_dir = self.session.output_dir or str(common_parent / "asteroidfinder_output")
         skipped = selected_count - len(paths)
-        self.input_edit.setText(_import_status_text(len(paths), skipped))
-        self.output_edit.setText(self.session.output_dir)
+        self._update_path_label(len(paths), skipped)
         self.viewer.clear_cache()
         self._plate_info_cache.clear()
         self.session.frames = [self._frame_info(path) for path in paths]
@@ -426,10 +424,10 @@ class MainWindow(QMainWindow):
         self._show_frame(0, keep_view=False)
 
     def choose_output_folder(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Choose output folder", self.output_edit.text() or str(Path.home()))
+        folder = QFileDialog.getExistingDirectory(self, "Choose output folder", self.session.output_dir or str(Path.home()))
         if folder:
             self.session.output_dir = folder
-            self.output_edit.setText(folder)
+            self._update_path_label(len(self.session.frames), 0)
 
     def save_session_file(self) -> None:
         if not self.session.output_dir:
@@ -439,6 +437,103 @@ class MainWindow(QMainWindow):
         self._sync_settings()
         path = save_session(self.session, Path(self.session.output_dir) / "session.json")
         self._log(f"Saved session: {path}")
+
+    def _open_calibration_dialog(self) -> None:
+        hot_sigma = _double_spin(self.session.settings.hot_sigma, 0.0, 50.0, 0.5)
+        dlg = WorkflowStepDialog("Calibrate Hot Pixels", [("Hot sigma", hot_sigma)], self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.session.settings.hot_sigma = hot_sigma.value()
+        self.run_calibration()
+
+    def _open_plate_solve_dialog(self) -> None:
+        index_dir = QLineEdit(self.session.settings.index_dir)
+        scale_low = _optional_double_spin()
+        if self.session.settings.scale_low:
+            scale_low.setValue(self.session.settings.scale_low)
+        scale_high = _optional_double_spin()
+        if self.session.settings.scale_high:
+            scale_high.setValue(self.session.settings.scale_high)
+        timeout = QSpinBox()
+        timeout.setRange(30, 1800)
+        timeout.setSingleStep(30)
+        timeout.setValue(self.session.settings.solve_timeout if hasattr(self.session.settings, "solve_timeout") else 300)
+        timeout.setToolTip("Maximum solve-field time per image, in seconds.")
+        dlg = WorkflowStepDialog("Plate Solve", [
+            ("Index dir", index_dir),
+            ("Scale low", scale_low),
+            ("Scale high", scale_high),
+            ("Timeout", timeout),
+        ], self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.session.settings.index_dir = index_dir.text().strip()
+        self.session.settings.scale_low = scale_low.value() if scale_low.value() > 0 else None
+        self.session.settings.scale_high = scale_high.value() if scale_high.value() > 0 else None
+        self._solve_timeout = timeout.value()
+        self.run_plate_solve()
+
+    def _open_alignment_dialog(self) -> None:
+        alignment_output = QComboBox()
+        alignment_output.addItem("Crop clean overlap", True)
+        alignment_output.addItem("Keep reference canvas", False)
+        dlg = WorkflowStepDialog("Align Stars", [("Output mode", alignment_output)], self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._alignment_crop = bool(alignment_output.currentData())
+        self.run_alignment()
+
+    def _open_tracking_dialog(self) -> None:
+        detect_sigma = _double_spin(self.session.settings.detect_sigma, 1.0, 20.0, 0.25)
+        min_detections = QSpinBox()
+        min_detections.setRange(2, 20)
+        min_detections.setValue(self.session.settings.min_detections)
+        dlg = WorkflowStepDialog("Detect Movers", [
+            ("Detect sigma", detect_sigma),
+            ("Min detections", min_detections),
+        ], self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.session.settings.detect_sigma = detect_sigma.value()
+        self.session.settings.min_detections = min_detections.value()
+        self.run_tracking()
+
+    def _open_known_objects_dialog(self) -> None:
+        observatory = QLineEdit(self.session.settings.observatory_code)
+        dlg = WorkflowStepDialog("Identify Known Objects", [("Observatory code", observatory)], self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.session.settings.observatory_code = observatory.text().strip() or "500"
+        self.query_known_objects()
+
+    def _open_export_dialog(self) -> None:
+        observatory = QLineEdit(self.session.settings.observatory_code)
+        dlg = WorkflowStepDialog("Export MPC Observations", [("Observatory code", observatory)], self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.session.settings.observatory_code = observatory.text().strip() or "500"
+        self.export_mpc()
+
+    def _open_ades_export_dialog(self) -> None:
+        observatory = QLineEdit(self.session.settings.observatory_code)
+        dlg = WorkflowStepDialog("Export ADES (PSV)", [("Observatory code", observatory)], self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.session.settings.observatory_code = observatory.text().strip() or "500"
+        self.export_ades()
+
+    def _open_cutout_window(self) -> None:
+        index = self._selected_track_index()
+        if index is None or index >= len(self.tracks):
+            self._error("No track selected", "Select a detected track first.")
+            return
+        track = self.tracks[index]
+        paths = self.session.frame_paths()
+        if not paths:
+            self._error("No frames", "Import images first.")
+            return
+        window = CutoutWindow(track, index, paths, parent=self)
+        window.show()
 
     def run_calibration(self) -> None:
         paths = self._require_paths()
@@ -450,7 +545,7 @@ class MainWindow(QMainWindow):
             calibrate_images_with_persistent_hot_pixels,
             paths,
             output_dir=out_dir,
-            hot_sigma=self.hot_sigma.value(),
+            hot_sigma=self.session.settings.hot_sigma,
         )
 
     def run_plate_solve(self) -> None:
@@ -459,6 +554,7 @@ class MainWindow(QMainWindow):
             return
         self._sync_settings()
         out_dir = self._output_dir() / "solved"
+        timeout = getattr(self, "_solve_timeout", 300)
 
         def solve_all(progress_callback: object | None = None) -> list[Path]:
             solved = []
@@ -472,7 +568,7 @@ class MainWindow(QMainWindow):
                     index_dir=self.session.settings.index_dir or None,
                     scale_low=self.session.settings.scale_low,
                     scale_high=self.session.settings.scale_high,
-                    timeout=self.solve_timeout.value(),
+                    timeout=timeout,
                 )
                 solved.append(result.solved_fits or result.path)
                 if callable(progress_callback):
@@ -485,7 +581,7 @@ class MainWindow(QMainWindow):
         paths = self._require_paths(prefer_solved=True)
         if not paths:
             return
-        crop_overlap = bool(self.alignment_output.currentData())
+        crop_overlap = getattr(self, "_alignment_crop", True)
         aligned_dir = self._output_dir() / "aligned"
         self._clear_generated_aligned_outputs(aligned_dir)
         self._start_worker(
@@ -507,8 +603,8 @@ class MainWindow(QMainWindow):
             "tracking",
             track_moving_objects,
             paths,
-            sigma=self.detect_sigma.value(),
-            min_detections=self.min_detections.value(),
+            sigma=self.session.settings.detect_sigma,
+            min_detections=self.session.settings.min_detections,
             assume_aligned=assume_aligned,
             max_sources=500,
         )
@@ -535,9 +631,10 @@ class MainWindow(QMainWindow):
         paths = self._require_paths(prefer_solved=True)
         if not paths:
             return
+        location = self.session.settings.observatory_code or "500"
 
         def query() -> list[KnownObject]:
-            objects = query_known_objects_with_motion_cache(paths, location=self.observatory_code.text().strip() or "500")
+            objects = query_known_objects_with_motion_cache(paths, location=location)
             write_known_objects_csv(objects, self._output_dir() / "known_objects.csv")
             return objects
 
@@ -564,10 +661,10 @@ class MainWindow(QMainWindow):
             run_asteroid_workflow,
             paths,
             output_dir=self._output_dir(),
-            hot_sigma=self.hot_sigma.value(),
-            sigma=self.detect_sigma.value(),
-            min_detections=self.min_detections.value(),
-            crop_overlap=bool(self.alignment_output.currentData()),
+            hot_sigma=self.session.settings.hot_sigma,
+            sigma=self.session.settings.detect_sigma,
+            min_detections=self.session.settings.min_detections,
+            crop_overlap=getattr(self, "_alignment_crop", True),
         )
 
     def export_mpc(self) -> None:
@@ -580,6 +677,7 @@ class MainWindow(QMainWindow):
         out_dir = self._output_dir()
         mpc_path = out_dir / "detected_track_mpc.txt"
         csv_path = out_dir / "detected_track_observations.csv"
+        observatory = self.session.settings.observatory_code or "500"
 
         def export() -> Path:
             from asteroidfinder.alignment import AlignedFrame
@@ -590,11 +688,36 @@ class MainWindow(QMainWindow):
                 self.tracks,
                 frames,
                 mpc_path,
-                observatory_code=self.observatory_code.text().strip() or "500",
+                observatory_code=observatory,
                 csv_path=csv_path,
             )
 
         self._start_worker("MPC export", export)
+
+    def export_ades(self) -> None:
+        if not self.tracks:
+            self._error("No tracks", "Run tracking before exporting ADES observations.")
+            return
+        paths = self._require_paths(prefer_aligned=True)
+        if not paths:
+            return
+        out_dir = self._output_dir()
+        ades_path = out_dir / "detected_track_ades.psv"
+        observatory = self.session.settings.observatory_code or "500"
+
+        def export() -> Path:
+            from asteroidfinder.alignment import AlignedFrame
+
+            images = [load_image(path) for path in paths]
+            frames = [AlignedFrame(image, image.data, None, None) for image in images]
+            return write_detected_track_ades(
+                self.tracks,
+                frames,
+                ades_path,
+                observatory_code=observatory,
+            )
+
+        self._start_worker("ADES export", export)
 
     def toggle_blink(self) -> None:
         if self._blink_timer.isActive():
@@ -667,6 +790,7 @@ class MainWindow(QMainWindow):
         elapsed = self._worker_elapsed_text(name)
         self._log(f"Finished {name} {elapsed}")
         self.progress_label.setText(f"Finished {name} {elapsed}")
+        self._mark_workflow_done(name)
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(1)
         self.progress_bar.setFormat("Done")
@@ -700,8 +824,7 @@ class MainWindow(QMainWindow):
             self._populate_tracks()
         elif name == "alignment":
             aligned_dir = self._output_dir() / "aligned"
-            mode = self.alignment_output.currentText()
-            self._log(f"Aligned FITS written to {aligned_dir} ({mode})")
+            self._log(f"Aligned FITS written to {aligned_dir}")
             self._log_alignment_qa()
             aligned_paths = [aligned_dir / f"{frame.image.path.stem}_aligned.fits" for frame in result] if isinstance(result, list) else []
             existing = [path for path in aligned_paths if path.exists()]
@@ -808,6 +931,8 @@ class MainWindow(QMainWindow):
             self._draw_track_indices(indices, clear_first=False)
         if self.show_known_objects.isChecked():
             self._draw_known_object_overlays()
+        if self.show_stars.isChecked():
+            self._draw_star_overlay()
 
     def _set_track_visible(self, index: int, checked: bool) -> None:
         if checked:
@@ -842,6 +967,33 @@ class MainWindow(QMainWindow):
         for index, obj in enumerate(self._known_objects_for_current_frame()):
             label = obj.name or obj.number or obj.object_type or "known"
             self.viewer.show_prediction_overlay(obj.x, obj.y, label, color=colors[index % len(colors)])
+
+    def _draw_star_overlay(self) -> None:
+        if not self.session.frames:
+            return
+        frame = self.session.frames[self._current_frame_index]
+        path = Path(frame.path)
+        try:
+            from asteroidfinder.detection import detect_sources
+            from asteroidfinder.io import load_image as _load
+
+            image = _load(path)
+            if image.header is None:
+                return
+            wcs = WCS(image.header)
+            if not wcs.has_celestial:
+                return
+            sources = detect_sources(image.data, sigma=5.0, max_sources=200)
+            pen = QPen(QColor("#4a6a8a"), 1.0)
+            for src in sources:
+                marker = QGraphicsEllipseItem(QRectF(src.x - 4, src.y - 4, 8, 8))
+                marker.setPen(pen)
+                marker.setBrush(Qt.BrushStyle.NoBrush)
+                marker.setZValue(5)
+                self.viewer._scene.addItem(marker)
+                self.viewer._overlay_items.append(marker)
+        except Exception:
+            pass
 
     def open_selected_movement_graph(self) -> None:
         index = self._selected_track_index()
@@ -1167,26 +1319,17 @@ class MainWindow(QMainWindow):
         return groups
 
     def _output_dir(self) -> Path:
-        if self.output_edit.text().strip():
-            self.session.output_dir = self.output_edit.text().strip()
-        elif self.session.input_dir:
-            self.session.output_dir = str(Path(self.session.input_dir) / "asteroidfinder_output")
-            self.output_edit.setText(self.session.output_dir)
-        else:
-            self.session.output_dir = str(Path.cwd() / "asteroidfinder_output")
-            self.output_edit.setText(self.session.output_dir)
+        if not self.session.output_dir:
+            if self.session.input_dir:
+                self.session.output_dir = str(Path(self.session.input_dir) / "asteroidfinder_output")
+            else:
+                self.session.output_dir = str(Path.cwd() / "asteroidfinder_output")
         output = Path(self.session.output_dir)
         output.mkdir(parents=True, exist_ok=True)
         return output
 
     def _sync_settings(self) -> None:
-        self.session.settings.index_dir = self.index_edit.text().strip()
-        self.session.settings.scale_low = self.scale_low.value() if self.scale_low.value() > 0 else None
-        self.session.settings.scale_high = self.scale_high.value() if self.scale_high.value() > 0 else None
-        self.session.settings.hot_sigma = self.hot_sigma.value()
-        self.session.settings.detect_sigma = self.detect_sigma.value()
-        self.session.settings.min_detections = self.min_detections.value()
-        self.session.settings.observatory_code = self.observatory_code.text().strip() or "500"
+        pass
 
     def _frame_info(self, path: Path) -> FrameInfo:
         try:
@@ -1209,6 +1352,31 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._log(f"Could not inspect {path}: {exc}")
             return FrameInfo(path=str(path))
+
+    def _update_path_label(self, count: int, skipped: int) -> None:
+        parts = [f"{count} images"]
+        if skipped:
+            parts.append(f"{skipped} skipped")
+        if self.session.input_dir:
+            short = Path(self.session.input_dir).name
+            parts.append(f"from {short}")
+        if self.session.output_dir:
+            short = Path(self.session.output_dir).name
+            parts.append(f"\u2192 {short}")
+        self.path_label.setText("  ".join(parts))
+        self.path_label.setToolTip(
+            f"Input: {self.session.input_dir or '(none)'}\nOutput: {self.session.output_dir or '(none)'}"
+        )
+
+    def _mark_workflow_done(self, name: str) -> None:
+        self._workflow_done[name] = True
+        action = self._workflow_actions.get(name)
+        if action is not None:
+            base = action.text().lstrip("\u2713 ")
+            action.setText(f"\u2713 {base}")
+        menu_action = self._menu_workflow_actions.get(name)
+        if menu_action is not None:
+            menu_action.setChecked(True)
 
     def _log(self, text: str) -> None:
         self.log.append(text)
@@ -1286,11 +1454,6 @@ def apply_dark_theme(app: QApplication) -> None:
         }
         QPushButton:pressed {
             background: #0e4f89;
-        }
-        QPushButton#WorkflowButton {
-            min-height: 30px;
-            max-height: 30px;
-            padding: 0 10px;
         }
         QPushButton#IconButton {
             color: #ffffff;
@@ -1374,12 +1537,6 @@ def _size_text(frame: FrameInfo) -> str:
     if frame.width is None or frame.height is None:
         return ""
     return f"{frame.width} x {frame.height}"
-
-
-def _lock_panel_width(panel: QWidget, width: int) -> None:
-    panel.setMinimumWidth(width)
-    panel.setMaximumWidth(width)
-    panel.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
 
 
 def _import_status_text(imported: int, skipped: int) -> str:
@@ -1965,8 +2122,9 @@ class ImageDiagnosticWindow(QDialog):
         self.index = min(max(start_index, 0), max(len(image_paths) - 1, 0))
         self._pixmap = QPixmap()
         self.setWindowTitle(title)
-        self.resize(1180, 820)
+        self.resize(960, 680)
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
         controls = QHBoxLayout()
         previous = _icon_button("◀", "Previous diagnostic")
         previous.clicked.connect(lambda: self._step(-1))
@@ -1985,10 +2143,8 @@ class ImageDiagnosticWindow(QDialog):
         self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.image_label.setStyleSheet("background: #0b111a;")
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(False)
-        self.scroll.setWidget(self.image_label)
-        layout.addWidget(self.scroll, 1)
+        self.image_label.setScaledContents(False)
+        layout.addWidget(self.image_label, 1)
         self._load_current()
 
     def _step(self, delta: int) -> None:
@@ -2013,19 +2169,102 @@ class ImageDiagnosticWindow(QDialog):
         if self._pixmap.isNull():
             self.image_label.setText("No preview")
             return
-        viewport = self.scroll.viewport().size()
+        available = self.image_label.size()
         scaled = self._pixmap.scaled(
-            max(64, viewport.width() - 16),
-            max(64, viewport.height() - 16),
+            max(64, available.width()),
+            max(64, available.height()),
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
         self.image_label.setPixmap(scaled)
-        self.image_label.resize(scaled.size())
 
     def resizeEvent(self, event: Any) -> None:
         super().resizeEvent(event)
         self._update_preview()
+
+
+class CutoutWindow(QDialog):
+    """Shows thumbnail cutouts from each frame around a track detection."""
+
+    CUTOUT_RADIUS = 40
+
+    def __init__(self, track: Track, track_index: int, frame_paths: list[Path], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.track = track
+        self.track_index = track_index
+        self.frame_paths = frame_paths
+        self.setWindowTitle(f"Track AF{track_index + 1:04d} Cutouts")
+        self.resize(820, 480)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+
+        header = QLabel(
+            f"AF{track_index + 1:04d}   {len(track.detections)} detections   "
+            f"score {track.score:.3f}"
+        )
+        header.setStyleSheet("font-size: 14px; font-weight: 600; color: #e8f3ff;")
+        layout.addWidget(header)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("background: #0b111a;")
+        container = QWidget()
+        self._grid = QHBoxLayout(container)
+        self._grid.setSpacing(8)
+        self._grid.setContentsMargins(8, 8, 8, 8)
+        scroll.setWidget(container)
+        layout.addWidget(scroll, 1)
+
+        self._load_cutouts()
+
+    def _load_cutouts(self) -> None:
+        detections = sorted(self.track.detections, key=lambda d: d.frame_index)
+        for det in detections:
+            if det.frame_index >= len(self.frame_paths):
+                continue
+            path = self.frame_paths[det.frame_index]
+            try:
+                image = load_image(path)
+                data = image.data
+                cx, cy = int(det.source.x), int(det.source.y)
+                r = self.CUTOUT_RADIUS
+                y0 = max(0, cy - r)
+                y1 = min(data.shape[0], cy + r)
+                x0 = max(0, cx - r)
+                x1 = min(data.shape[1], cx + r)
+                cutout = data[y0:y1, x0:x1]
+                from asteroidfinder.io import stretch_to_uint8
+
+                pixels = stretch_to_uint8(cutout.astype(float), percentile=(1.0, 99.0))
+                h, w = pixels.shape
+                qimg = QImage(np.ascontiguousarray(pixels).data, w, h, w, QImage.Format.Format_Grayscale8).copy()
+                pixmap = QPixmap.fromImage(qimg).scaled(
+                    160, 160,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                card = QVBoxLayout()
+                thumb = QLabel()
+                thumb.setPixmap(pixmap)
+                thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                thumb.setStyleSheet("border: 1px solid #26364a; border-radius: 4px;")
+                info = QLabel(
+                    f"F{det.frame_index}  ({det.source.x:.1f}, {det.source.y:.1f})\n"
+                    f"SNR {det.source.snr:.1f}"
+                )
+                info.setObjectName("MutedText")
+                info.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                card.addWidget(thumb)
+                card.addWidget(info)
+                frame = QWidget()
+                frame.setLayout(card)
+                self._grid.addWidget(frame)
+            except Exception:
+                error_label = QLabel(f"F{det.frame_index}\n(load error)")
+                error_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                error_label.setObjectName("MutedText")
+                self._grid.addWidget(error_label)
+        self._grid.addStretch(1)
 
 
 class KnownObjectsWindow(QDialog):
@@ -2072,18 +2311,30 @@ class ReportWindow(QDialog):
         super().__init__(parent)
         self.path = path
         self.setWindowTitle("AsteroidFinder Report")
-        self.resize(1120, 780)
+        self.resize(1020, 700)
         layout = QVBoxLayout(self)
-        controls = QHBoxLayout()
+        layout.setContentsMargins(12, 12, 12, 12)
+
+        header = QHBoxLayout()
+        title = QLabel("Session Report")
+        title.setStyleSheet("font-size: 16px; font-weight: 700; color: #e8f3ff;")
+        folder_label = QLabel(str(path.parent))
+        folder_label.setObjectName("MutedText")
+        folder_label.setWordWrap(True)
+        header.addWidget(title)
+        header.addStretch(1)
         open_browser = QPushButton("Open In Browser")
         open_browser.clicked.connect(lambda: webbrowser.open(self.path.resolve().as_uri()))
+        open_folder = QPushButton("Open Folder")
+        open_folder.clicked.connect(lambda: webbrowser.open(self.path.parent.resolve().as_uri()))
         refresh = QPushButton("Refresh")
         refresh.clicked.connect(self._load_report)
-        controls.addWidget(QLabel(str(path)))
-        controls.addStretch(1)
-        controls.addWidget(refresh)
-        controls.addWidget(open_browser)
-        layout.addLayout(controls)
+        header.addWidget(refresh)
+        header.addWidget(open_folder)
+        header.addWidget(open_browser)
+        layout.addLayout(header)
+        layout.addWidget(folder_label)
+
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs, 1)
         self._load_report()
@@ -2091,33 +2342,52 @@ class ReportWindow(QDialog):
     def _load_report(self) -> None:
         self.tabs.clear()
         out_dir = self.path.parent
-        self.tabs.addTab(self._summary_tab(out_dir), "Summary")
+        self.tabs.addTab(self._summary_tab(out_dir), "Overview")
         for title, filename in [
             ("Tracks", "tracks.csv"),
             ("Known Objects", "known_objects.csv"),
             ("Alignment", "alignment_report.csv"),
             ("Hot Pixels", "hot_pixel_report.csv"),
-            ("Forced Photometry", "known_object_forced_photometry.csv"),
+            ("Photometry", "known_object_forced_photometry.csv"),
         ]:
             rows = _read_csv_file(out_dir / filename)
             if rows:
-                self.tabs.addTab(_table_widget(rows), title)
+                self.tabs.addTab(_table_widget(rows), f"{title} ({len(rows)})")
         self.tabs.addTab(self._files_tab(out_dir), "Files")
 
     def _summary_tab(self, out_dir: Path) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(8)
+
+        tracks = _read_csv_file(out_dir / "tracks.csv")
+        known = _read_csv_file(out_dir / "known_objects.csv")
+        alignment = _read_csv_file(out_dir / "alignment_report.csv")
+        hotpix = _read_csv_file(out_dir / "hot_pixel_report.csv")
+
         metrics = [
-            ("Output folder", str(out_dir)),
-            ("Tracks", str(len(_read_csv_file(out_dir / "tracks.csv")))),
-            ("Known objects", str(len(_read_csv_file(out_dir / "known_objects.csv")))),
-            ("Alignment rows", str(len(_read_csv_file(out_dir / "alignment_report.csv")))),
-            ("Movement charts", "native desktop viewer"),
+            ("Detected tracks", str(len(tracks)), "#38bdf8"),
+            ("Known objects", str(len(known)), "#34d399"),
+            ("Aligned frames", str(len(alignment)), "#a78bfa"),
+            ("Hot pixel frames", str(len(hotpix)), "#fbbf24"),
         ]
-        for label, value in metrics:
-            row = QLabel(f"<b>{label}</b>: {value}")
-            row.setTextFormat(Qt.TextFormat.RichText)
-            layout.addWidget(row)
+
+        grid = QHBoxLayout()
+        for label, value, color in metrics:
+            card = QVBoxLayout()
+            num = QLabel(value)
+            num.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            num.setStyleSheet(f"font-size: 28px; font-weight: 700; color: {color};")
+            desc = QLabel(label)
+            desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            desc.setObjectName("MutedText")
+            card.addWidget(num)
+            card.addWidget(desc)
+            frame = QGroupBox()
+            frame.setLayout(card)
+            grid.addWidget(frame)
+        layout.addLayout(grid)
         layout.addStretch(1)
         return widget
 
@@ -2128,6 +2398,7 @@ class ReportWindow(QDialog):
         for path in sorted(out_dir.rglob("*")):
             if path.is_file():
                 files.addItem(str(path.relative_to(out_dir)))
+        files.itemDoubleClicked.connect(lambda item: webbrowser.open((out_dir / item.text()).resolve().as_uri()))
         layout.addWidget(files, 1)
         return widget
 
@@ -2141,7 +2412,7 @@ class QaWindow(QDialog):
         self.image_list = QListWidget()
         self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_label.setStyleSheet("background: #ffffff; color: #111111;")
+        self.image_label.setStyleSheet("background: #0b111a;")
         self._current_pixmap = QPixmap()
         self.setWindowTitle(title)
         self.resize(980, 640)
@@ -2215,12 +2486,13 @@ class QaWindow(QDialog):
             self.image_label.setText("No preview")
             return
         viewport = self.mask_scroll.viewport().size() if hasattr(self, "mask_scroll") else self.size()
-        scale = max(1, min((viewport.width() - 16) // max(1, self._current_pixmap.width()), (viewport.height() - 16) // max(1, self._current_pixmap.height())))
+        available_w = max(64, viewport.width() - 16)
+        available_h = max(64, viewport.height() - 16)
         scaled = self._current_pixmap.scaled(
-            self._current_pixmap.width() * scale,
-            self._current_pixmap.height() * scale,
+            available_w,
+            available_h,
             Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.FastTransformation,
+            Qt.TransformationMode.SmoothTransformation,
         )
         self.image_label.setPixmap(scaled)
         self.image_label.resize(scaled.size())

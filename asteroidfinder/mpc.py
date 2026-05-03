@@ -235,5 +235,74 @@ def _magnitude(header: object, detection: object) -> tuple[float | None, str]:
     return phot.instrumental_mag, "instrumental"
 
 
+def write_detected_track_ades(
+    tracks: Sequence[Track],
+    aligned_frames: Sequence[AlignedFrame],
+    path: str | Path,
+    *,
+    observatory_code: str,
+    object_prefix: str = "AF",
+) -> Path:
+    """Write measured detected-track observations in ADES (PSV) format.
+
+    ADES Pipe-Separated Values is the modern MPC submission format. This
+    generates a PSV file with astrometric observations derived from measured
+    track centroids and frame WCS.
+    """
+
+    observations = measured_observations_from_tracks(
+        tracks,
+        aligned_frames,
+        observatory_code=observatory_code,
+        object_prefix=object_prefix,
+    )
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    with output.open("w", newline="") as handle:
+        handle.write("# version=2017\n")
+        handle.write("# observatory\n")
+        handle.write(f"! mpcCode {observatory_code}\n")
+        handle.write("# submitter\n")
+        handle.write("! name AsteroidFinder\n")
+        handle.write("# observers\n")
+        handle.write("! name Observer\n")
+        handle.write("# measurers\n")
+        handle.write("! name AsteroidFinder\n")
+        handle.write("# telescope\n")
+        handle.write("! aperture 0.0\n")
+        handle.write("! design reflector\n")
+        handle.write("! detector CCD\n")
+        handle.write("permID|provID|trkSub|mode|stn|obsTime|ra|dec|rmsRA|rmsDec|astCat|mag|rmsMag|band|photCat|notes\n")
+        for obs in observations:
+            object_id = f"{object_prefix}{obs.track_id:04d}"
+            time_iso = Time(obs.date_obs, format="isot", scale="utc")
+            mag_str = _fmt(obs.magnitude, 2) if obs.magnitude is not None else ""
+            handle.write(
+                "|".join(
+                    [
+                        "",
+                        "",
+                        object_id,
+                        "CCD",
+                        obs.observatory_code,
+                        time_iso.isot + "Z",
+                        f"{obs.ra_deg:.7f}",
+                        f"{obs.dec_deg:.7f}",
+                        "",
+                        "",
+                        "",
+                        mag_str,
+                        "",
+                        obs.band,
+                        "",
+                        "",
+                    ]
+                )
+                + "\n"
+            )
+    return output
+
+
 def _fmt(value: float | None, digits: int) -> str:
     return "" if value is None else f"{value:.{digits}f}"

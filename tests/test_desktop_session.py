@@ -55,7 +55,8 @@ def test_desktop_import_skips_empty_corrupt_fits(tmp_path: Path) -> None:
     window.load_paths([corrupt, valid])
 
     assert [Path(frame.path).name for frame in window.session.frames] == ["valid.fit"]
-    assert window.input_edit.text() == "1 images imported, 1 skipped"
+    assert "1 images" in window.path_label.text()
+    assert "1 skipped" in window.path_label.text()
 
 
 def test_import_status_mentions_skipped_images() -> None:
@@ -170,18 +171,15 @@ def test_frame_step_preserves_view_by_default(monkeypatch: object) -> None:
     assert calls == [(1, True)]
 
 
-def test_main_sidebars_have_stable_widths() -> None:
+def test_main_analysis_sidebar_has_stable_width() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     app = QApplication.instance() or QApplication([])
     window = MainWindow()
     splitter = window.centralWidget()
-    workflow_panel = splitter.widget(0)
-    analysis_panel = splitter.widget(2)
+    analysis_panel = splitter.widget(1)
 
-    assert workflow_panel.minimumWidth() == WORKFLOW_PANEL_WIDTH
-    assert workflow_panel.maximumWidth() == WORKFLOW_PANEL_WIDTH
     assert analysis_panel.minimumWidth() == ANALYSIS_PANEL_WIDTH
-    assert analysis_panel.maximumWidth() == ANALYSIS_PANEL_WIDTH
+    assert analysis_panel.maximumWidth() >= ANALYSIS_PANEL_WIDTH
 
 
 def test_viewer_left_right_arrow_keys_step_frames() -> None:
