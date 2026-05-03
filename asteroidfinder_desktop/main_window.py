@@ -9,6 +9,7 @@ import webbrowser
 
 import numpy as np
 from astropy.io import fits
+from astropy.time import Time
 from astropy.wcs import WCS
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
@@ -57,7 +58,7 @@ from asteroidfinder.mpc import write_detected_track_ades, write_detected_track_m
 from asteroidfinder.platesolve import solve_image
 from asteroidfinder.report import generate_html_report
 from asteroidfinder.tracking import Track, track_moving_objects
-from asteroidfinder.workflow import run_asteroid_workflow
+from asteroidfinder.workflow import write_tracks_csv
 
 from .session import FITS_EXTENSIONS, IMAGE_EXTENSIONS, FrameInfo, SessionState, filter_image_files, natural_sorted, save_session
 from .viewer import FitsViewer, PreparedDisplayFrame, prepare_display_frame
@@ -110,9 +111,12 @@ class MainWindow(QMainWindow):
         self._report_windows: list[QDialog] = []
         self._qa_windows: list[QDialog] = []
         self._known_object_windows: list[QDialog] = []
+        self._prediction_windows: list[QDialog] = []
+        self._submission_windows: list[QDialog] = []
         self.tracks: list[Track] = []
         self.known_objects: list[KnownObject] = []
         self.track_known_matches: dict[int, str] = {}
+        self.track_known_objects: dict[int, KnownObject] = {}
         self.visible_track_indices: set[int] = set()
         self._last_skipped_images = 0
         self._worker_started_at: dict[str, float] = {}
@@ -189,7 +193,8 @@ class MainWindow(QMainWindow):
             ("alignment", "Align", self._open_alignment_dialog),
             ("tracking", "Detect", self._open_tracking_dialog),
             ("known objects", "Known", self._open_known_objects_dialog),
-            ("MPC export", "Export", self._open_export_dialog),
+            ("prediction", "Predict", self.open_prediction_window),
+            ("submission export", "Submit", self.open_submission_window),
             ("report", "Report", self.open_report_window),
         ]:
             action = QAction(label, self)
@@ -271,7 +276,8 @@ class MainWindow(QMainWindow):
             ("alignment", "Align Stars", self._open_alignment_dialog),
             ("tracking", "Detect Movers", self._open_tracking_dialog),
             ("known objects", "Identify Known", self._open_known_objects_dialog),
-            ("MPC export", "Export MPC", self._open_export_dialog),
+            ("prediction", "Predict Track Path", self.open_prediction_window),
+            ("submission export", "Submission Window", self.open_submission_window),
             ("report", "Report", self.open_report_window),
         ]:
             action = QAction(label, self)
@@ -286,12 +292,14 @@ class MainWindow(QMainWindow):
         analysis_menu = self.menuBar().addMenu("Analysis")
         analysis_menu.addAction("Movement Chart", self.open_or_generate_movement_graph)
         analysis_menu.addAction("Track Cutouts", self._open_cutout_window)
+        analysis_menu.addAction("Prediction Window", self.open_prediction_window)
         analysis_menu.addAction("Known Object Info", self.open_known_objects_window)
         analysis_menu.addSeparator()
         analysis_menu.addAction("Hot Pixel QA", self.open_hot_pixel_qa)
         analysis_menu.addAction("Alignment QA", self.open_alignment_qa)
         analysis_menu.addAction("PNG Diagnostics", self.write_png_diagnostics)
         analysis_menu.addSeparator()
+        analysis_menu.addAction("Submission Window", self.open_submission_window)
         analysis_menu.addAction("Export MPC (80-col)", self._open_export_dialog)
         analysis_menu.addAction("Export ADES (PSV)", self._open_ades_export_dialog)
         analysis_menu.addAction("Report", self.open_report_window)
@@ -335,6 +343,7 @@ class MainWindow(QMainWindow):
         self.frame_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.frame_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.frame_table.itemSelectionChanged.connect(self._selected_frame_changed)
+        _install_table_copy_shortcut(self.frame_table)
         layout.addWidget(QLabel("Frames"))
         layout.addWidget(self.frame_table, 2)
 
@@ -352,6 +361,7 @@ class MainWindow(QMainWindow):
         self.track_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.track_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.track_table.itemSelectionChanged.connect(self._selected_track_changed)
+        _install_table_copy_shortcut(self.track_table)
         layout.addWidget(QLabel("Detected Tracks"))
         overlay_row = QHBoxLayout()
         overlay_row.addWidget(self.show_full_track)
@@ -378,6 +388,9 @@ class MainWindow(QMainWindow):
 
     def _wire_actions(self) -> None:
         self.blink_slider.valueChanged.connect(lambda _: self._blink_timer.setInterval(self._blink_interval_ms()))
+        self._copy_shortcut = QShortcut(QKeySequence.StandardKey.Copy, self)
+        self._copy_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self._copy_shortcut.activated.connect(self._copy_active_content)
         self._space_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
         self._space_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
         self._space_shortcut.activated.connect(self.toggle_blink)
@@ -599,14 +612,23 @@ class MainWindow(QMainWindow):
             return
         aligned_dir = self._output_dir() / "aligned"
         assume_aligned = bool(paths) and all(Path(path).parent == aligned_dir for path in paths)
+
+        def detect(progress_callback: object | None = None) -> list[Track]:
+            tracks = track_moving_objects(
+                paths,
+                sigma=self.session.settings.detect_sigma,
+                min_detections=self.session.settings.min_detections,
+                assume_aligned=assume_aligned,
+                max_sources=500,
+            )
+            write_tracks_csv(tracks, self._output_dir() / "tracks.csv")
+            if callable(progress_callback):
+                progress_callback(1, 1, f"Detected {len(tracks)} track(s)")
+            return tracks
+
         self._start_worker(
             "tracking",
-            track_moving_objects,
-            paths,
-            sigma=self.session.settings.detect_sigma,
-            min_detections=self.session.settings.min_detections,
-            assume_aligned=assume_aligned,
-            max_sources=500,
+            detect,
         )
 
     def generate_movement_graphs(self) -> None:
@@ -652,19 +674,101 @@ class MainWindow(QMainWindow):
         self._known_object_windows.append(window)
         window.show()
 
+    def open_prediction_window(self) -> None:
+        if not self.tracks:
+            self._error("No tracks", "Run Detect Movers before opening prediction tools.")
+            return
+        index = self._selected_track_index()
+        if index is None:
+            index = 0
+        window = PredictionWindow(
+            self.tracks,
+            self.session.frames,
+            start_index=index,
+            known_matches=self.track_known_matches,
+            known_objects=self.known_objects,
+            matched_known_objects=self.track_known_objects,
+            parent=self,
+        )
+        window.destroyed.connect(lambda *_: self._forget_prediction_window(window))
+        self._prediction_windows.append(window)
+        window.show()
+
+    def open_submission_window(self) -> None:
+        if not self.tracks:
+            self._error("No tracks", "Run Detect Movers before opening submission tools.")
+            return
+        window = SubmissionWindow(
+            self.tracks,
+            self.track_known_matches,
+            observatory_code=self.session.settings.observatory_code or "500",
+            output_dir=self._output_dir(),
+            export_callback=self.export_selected_submission,
+            parent=self,
+        )
+        window.destroyed.connect(lambda *_: self._forget_submission_window(window))
+        self._submission_windows.append(window)
+        window.show()
+
     def run_full_workflow(self) -> None:
         paths = self._require_paths()
         if not paths:
             return
+
+        out_dir = self._output_dir()
+        calibrated_dir = out_dir / "calibrated"
+        aligned_dir = out_dir / "aligned"
+        crop_overlap = getattr(self, "_alignment_crop", True)
+
+        def full_pipeline(progress_callback: object | None = None) -> dict[str, object]:
+            def progress(done: int, total: int, text: str) -> None:
+                if callable(progress_callback):
+                    progress_callback(done, total, text)
+
+            progress(0, 3, "Calibrating frames")
+            calibration = calibrate_images_with_persistent_hot_pixels(
+                paths,
+                output_dir=calibrated_dir,
+                hot_sigma=self.session.settings.hot_sigma,
+            )
+            calibrated_paths = [
+                calibrated_dir / f"{item.image.path.stem}_calibrated.fits"
+                for item in calibration
+                if (calibrated_dir / f"{item.image.path.stem}_calibrated.fits").exists()
+            ]
+            progress(1, 3, "Aligning calibrated frames")
+            self._clear_generated_aligned_outputs(aligned_dir)
+            aligned_frames = align_images(
+                calibrated_paths,
+                output_dir=aligned_dir,
+                crop_overlap=crop_overlap,
+                prefer_translation=False,
+            )
+            aligned_paths = [
+                aligned_dir / f"{frame.image.path.stem}_aligned.fits"
+                for frame in aligned_frames
+                if (aligned_dir / f"{frame.image.path.stem}_aligned.fits").exists()
+            ]
+            progress(2, 3, "Detecting movers on aligned frames")
+            tracks = track_moving_objects(
+                aligned_paths,
+                sigma=self.session.settings.detect_sigma,
+                min_detections=self.session.settings.min_detections,
+                assume_aligned=True,
+                max_sources=500,
+            )
+            write_tracks_csv(tracks, out_dir / "tracks.csv")
+            progress(3, 3, f"Detected {len(tracks)} track(s)")
+            return {
+                "calibration": calibration,
+                "aligned_frames": aligned_frames,
+                "aligned_paths": aligned_paths,
+                "tracks": tracks,
+            }
+
         self._start_worker(
             "basic workflow",
-            run_asteroid_workflow,
-            paths,
-            output_dir=self._output_dir(),
-            hot_sigma=self.session.settings.hot_sigma,
-            sigma=self.session.settings.detect_sigma,
-            min_detections=self.session.settings.min_detections,
-            crop_overlap=getattr(self, "_alignment_crop", True),
+            full_pipeline,
         )
 
     def export_mpc(self) -> None:
@@ -718,6 +822,60 @@ class MainWindow(QMainWindow):
             )
 
         self._start_worker("ADES export", export)
+
+    def export_selected_submission(
+        self,
+        indices: list[int],
+        *,
+        observatory_code: str,
+        object_prefix: str,
+        export_format: str,
+    ) -> None:
+        selected = [index for index in indices if 0 <= index < len(self.tracks)]
+        if not selected:
+            self._error("No tracks selected", "Select at least one detected track for export.")
+            return
+        paths = self._require_paths(prefer_aligned=True)
+        if not paths:
+            return
+        self.session.settings.observatory_code = observatory_code.strip() or "500"
+        prefix = object_prefix.strip() or "AF"
+        out_dir = self._output_dir()
+        selected_tracks = [self.tracks[index] for index in selected]
+        track_ids = [index + 1 for index in selected]
+
+        def export() -> list[Path]:
+            from asteroidfinder.alignment import AlignedFrame
+
+            images = [load_image(path) for path in paths]
+            frames = [AlignedFrame(image, image.data, None, None) for image in images]
+            written: list[Path] = []
+            if export_format in {"MPC", "Both"}:
+                written.append(
+                    write_detected_track_mpc(
+                        selected_tracks,
+                        frames,
+                        out_dir / "submission_mpc.txt",
+                        observatory_code=self.session.settings.observatory_code,
+                        object_prefix=prefix,
+                        csv_path=out_dir / "submission_observations.csv",
+                        track_ids=track_ids,
+                    )
+                )
+            if export_format in {"ADES", "Both"}:
+                written.append(
+                    write_detected_track_ades(
+                        selected_tracks,
+                        frames,
+                        out_dir / "submission_ades.psv",
+                        observatory_code=self.session.settings.observatory_code,
+                        object_prefix=prefix,
+                        track_ids=track_ids,
+                    )
+                )
+            return written
+
+        self._start_worker("submission export", export)
 
     def toggle_blink(self) -> None:
         if self._blink_timer.isActive():
@@ -817,11 +975,21 @@ class MainWindow(QMainWindow):
             self._match_known_objects_to_tracks()
             self._populate_tracks()
         elif name == "basic workflow":
-            tracks = getattr(result, "tracks", [])
+            data = result if isinstance(result, dict) else {}
+            tracks = data.get("tracks", getattr(result, "tracks", []))
+            aligned_paths = [Path(path) for path in data.get("aligned_paths", [])] if isinstance(data, dict) else []
+            if aligned_paths:
+                self.session.frames = [self._frame_info(path) for path in aligned_paths]
+                self._populate_frames()
+                self._show_frame(0, keep_view=False)
             self.tracks = list(tracks)
             self.visible_track_indices = {0} if self.tracks else set()
             self._match_known_objects_to_tracks()
             self._populate_tracks()
+            self._log_hot_pixel_qa()
+            self._log_alignment_qa()
+            for completed in ("calibration", "alignment", "tracking"):
+                self._mark_workflow_done(completed)
         elif name == "alignment":
             aligned_dir = self._output_dir() / "aligned"
             self._log(f"Aligned FITS written to {aligned_dir}")
@@ -848,6 +1016,9 @@ class MainWindow(QMainWindow):
         elif name == "PNG diagnostics":
             paths = [Path(path) for path in result] if isinstance(result, list) else []
             self._log(f"PNG diagnostics written: {len(paths)} file(s) in {self._output_dir() / 'diagnostics'}")
+        elif name == "submission export":
+            paths = [Path(path) for path in result] if isinstance(result, list) else []
+            self._log("Submission files written: " + ", ".join(path.name for path in paths))
         elif name == "report":
             path = Path(result) if isinstance(result, (str, Path)) else self._output_dir() / "report.html"
             self._open_report_dialog(path)
@@ -885,16 +1056,19 @@ class MainWindow(QMainWindow):
             show.setToolTip("Show this detected track on the image")
             show.toggled.connect(lambda checked, index=row: self._set_track_visible(index, checked))
             self.track_table.setCellWidget(row, 0, show)
+            known_name = self.track_known_matches.get(row, "")
             values = [
-                str(row + 1),
+                f"AF{row + 1:04d}" + (f"\n{known_name}" if known_name else ""),
                 str(len(track.detections)),
-                self.track_known_matches.get(row, "unknown"),
+                known_name or "unknown",
                 "" if track.angular_rate_arcsec_per_frame is None else f"{track.angular_rate_arcsec_per_frame:.3f}",
                 "" if track.position_angle_deg is None else f"{track.position_angle_deg:.1f}",
                 f"{track.score:.3f}",
             ]
             for column, value in enumerate(values):
                 self.track_table.setItem(row, column + 1, QTableWidgetItem(value))
+            if known_name:
+                self.track_table.setRowHeight(row, max(self.track_table.rowHeight(row), 46))
         self._updating_track_table = False
         self._log(f"Tracking found {len(self.tracks)} candidate tracks")
         if self.tracks:
@@ -956,7 +1130,7 @@ class MainWindow(QMainWindow):
             )
             self.viewer.show_track_overlay(
                 points,
-                f"AF{index + 1:04d}",
+                f"AF{index + 1:04d}" + (f"\n{self.track_known_matches[index]}" if index in self.track_known_matches else ""),
                 mode=mode or ("path" if self.show_full_track.isChecked() else "circle"),
                 current_index=current_detection_index,
                 color=colors[index % len(colors)],
@@ -986,7 +1160,9 @@ class MainWindow(QMainWindow):
             sources = detect_sources(image.data, sigma=5.0, max_sources=200)
             pen = QPen(QColor("#4a6a8a"), 1.0)
             for src in sources:
-                marker = QGraphicsEllipseItem(QRectF(src.x - 4, src.y - 4, 8, 8))
+                radius_x = max(3.0, min(24.0, src.a * 3.0))
+                radius_y = max(3.0, min(24.0, src.b * 3.0))
+                marker = QGraphicsEllipseItem(QRectF(src.x - radius_x, src.y - radius_y, radius_x * 2, radius_y * 2))
                 marker.setPen(pen)
                 marker.setBrush(Qt.BrushStyle.NoBrush)
                 marker.setZValue(5)
@@ -1045,6 +1221,14 @@ class MainWindow(QMainWindow):
         if window in self._known_object_windows:
             self._known_object_windows.remove(window)
 
+    def _forget_prediction_window(self, window: QDialog) -> None:
+        if window in self._prediction_windows:
+            self._prediction_windows.remove(window)
+
+    def _forget_submission_window(self, window: QDialog) -> None:
+        if window in self._submission_windows:
+            self._submission_windows.remove(window)
+
     def _open_report_dialog(self, path: Path) -> None:
         window = ReportWindow(path, parent=self)
         window.destroyed.connect(lambda *_: self._forget_report_window(window))
@@ -1060,17 +1244,17 @@ class MainWindow(QMainWindow):
         if not path.exists():
             self._error("No hot pixel QA", "Run Clean Hot Pixels first.")
             return
-        self._open_qa_window("Hot Pixel QA", path, self._hot_pixel_qa_dir())
+        self._open_qa_window("Hot Pixel QA", path, self._hot_pixel_qa_dir(), mask_controls=True)
 
     def open_alignment_qa(self) -> None:
         path = self._alignment_qa_path()
         if not path.exists():
             self._error("No alignment QA", "Run Align Stars first.")
             return
-        self._open_qa_window("Alignment QA", path, path.parent)
+        self._open_qa_window("Alignment QA", path, path.parent, mask_controls=False)
 
-    def _open_qa_window(self, title: str, csv_path: Path, folder: Path) -> None:
-        window = QaWindow(title, csv_path, folder, parent=self)
+    def _open_qa_window(self, title: str, csv_path: Path, folder: Path, *, mask_controls: bool) -> None:
+        window = QaWindow(title, csv_path, folder, mask_controls=mask_controls, parent=self)
         window.destroyed.connect(lambda *_: self._forget_qa_window(window))
         self._qa_windows.append(window)
         window.show()
@@ -1117,33 +1301,35 @@ class MainWindow(QMainWindow):
 
     def _match_known_objects_to_tracks(self, *, radius_px: float = 20.0) -> None:
         self.track_known_matches = {}
+        self.track_known_objects = {}
         if not self.tracks or not self.known_objects:
             return
-        objects_by_frame: dict[int, list[KnownObject]] = {}
-        frame_names = [Path(frame.path).name for frame in self.session.frames]
-        for obj in self.known_objects:
-            try:
-                frame_index = frame_names.index(Path(obj.frame).name)
-            except ValueError:
-                frame_index = 0
-            objects_by_frame.setdefault(frame_index, []).append(obj)
         for track_index, track in enumerate(self.tracks):
             best_name = ""
+            best_object: KnownObject | None = None
             best_distance = radius_px
             for det in track.detections:
-                for obj in objects_by_frame.get(det.frame_index, []):
+                if det.frame_index >= len(self.session.frames):
+                    continue
+                frame = self.session.frames[det.frame_index]
+                for obj in _known_objects_matching_frame(self.known_objects, Path(frame.path), det.frame_index):
                     distance = ((det.source.x - obj.x) ** 2 + (det.source.y - obj.y) ** 2) ** 0.5
                     if distance <= best_distance:
                         best_distance = distance
+                        best_object = obj
                         best_name = obj.name or obj.number
             if best_name:
                 self.track_known_matches[track_index] = best_name
+            if best_object is not None:
+                self.track_known_objects[track_index] = best_object
 
     def _known_objects_for_current_frame(self) -> list[KnownObject]:
         if not self.known_objects or not self.session.frames:
             return []
         frame = self.session.frames[self._current_frame_index]
-        return _known_objects_matching_frame(self.known_objects, Path(frame.path), self._current_frame_index)
+        matched_identities = {_known_identity(obj) for obj in self.track_known_objects.values()}
+        objects = _known_objects_matching_frame(self.known_objects, Path(frame.path), self._current_frame_index)
+        return [obj for obj in objects if _known_identity(obj) not in matched_identities]
 
     def _selected_track_index(self) -> int | None:
         rows = self.track_table.selectionModel().selectedRows()
@@ -1345,7 +1531,7 @@ class MainWindow(QMainWindow):
                 path=str(path),
                 width=int(shape[1]),
                 height=int(shape[0]),
-                date_obs=None if header is None else str(header.get("DATE-OBS", "")) or None,
+                date_obs=None if header is None else _header_observation_time_text(header),
                 filter_name=None if header is None else str(header.get("FILTER", "")) or None,
                 has_wcs=has_wcs,
             )
@@ -1380,6 +1566,22 @@ class MainWindow(QMainWindow):
 
     def _log(self, text: str) -> None:
         self.log.append(text)
+
+    def _copy_active_content(self) -> None:
+        focus = QApplication.focusWidget()
+        table = _ancestor_table_widget(focus)
+        if table is not None:
+            _copy_table_to_clipboard(table)
+            return
+        if focus is not None and (focus is self.log or self.log.isAncestorOf(focus)):
+            _copy_text_edit_to_clipboard(self.log)
+            return
+        if self.track_table.selectionModel().hasSelection():
+            _copy_table_to_clipboard(self.track_table)
+        elif self.frame_table.selectionModel().hasSelection():
+            _copy_table_to_clipboard(self.frame_table)
+        else:
+            _copy_text_edit_to_clipboard(self.log)
 
     def _error(self, title: str, detail: str) -> None:
         QMessageBox.critical(self, title, detail)
@@ -1702,6 +1904,28 @@ def _plate_info_for(path: Path, shape: tuple[int, ...], header: object | None) -
         return f"WCS read failed: {exc}", "", "", path.name
 
 
+def _header_observation_time_text(header: fits.Header) -> str | None:
+    for key in ("DATE-OBS", "DATEOBS", "DATE"):
+        value = header.get(key)
+        if value not in {None, ""}:
+            return str(value)
+    for key in ("OBSJD", "JD", "JULDATE"):
+        value = header.get(key)
+        if value not in {None, ""}:
+            try:
+                return Time(float(value), format="jd", scale="utc").isot
+            except Exception:
+                pass
+    for key in ("MJD-OBS", "MJD"):
+        value = header.get(key)
+        if value not in {None, ""}:
+            try:
+                return Time(float(value), format="mjd", scale="utc").isot
+            except Exception:
+                pass
+    return None
+
+
 def _track_summary(track: Track, index: int, known_name: str = "") -> str:
     pixel_speed = (track.velocity_x**2 + track.velocity_y**2) ** 0.5
     sky_speed = "unknown" if track.angular_rate_arcsec_per_frame is None else f"{track.angular_rate_arcsec_per_frame:.3f} arcsec/frame"
@@ -1720,6 +1944,247 @@ def _track_summary(track: Track, index: int, known_name: str = "") -> str:
         src = det.source
         lines.append(f"{det.frame_index},{src.x:.3f},{src.y:.3f},{src.snr:.3f},{src.flux:.3f}")
     return "\n".join(lines)
+
+
+def _copy_table_to_clipboard(table: QTableWidget) -> None:
+    headers = [table.horizontalHeaderItem(column).text() for column in range(table.columnCount())]
+    lines = ["\t".join(headers)]
+    selected_rows = sorted({index.row() for index in table.selectedIndexes()})
+    rows = selected_rows or list(range(table.rowCount()))
+    for row in rows:
+        values = []
+        for column in range(table.columnCount()):
+            widget = table.cellWidget(row, column)
+            if isinstance(widget, QCheckBox):
+                values.append("yes" if widget.isChecked() else "no")
+                continue
+            item = table.item(row, column)
+            values.append("" if item is None else item.text())
+        lines.append("\t".join(values))
+    QApplication.clipboard().setText("\n".join(lines))
+
+
+def _copy_text_edit_to_clipboard(edit: QTextEdit) -> None:
+    cursor = edit.textCursor()
+    selected = cursor.selectedText().replace("\u2029", "\n")
+    QApplication.clipboard().setText(selected or edit.toPlainText())
+
+
+def _ancestor_table_widget(widget: QWidget | None) -> QTableWidget | None:
+    while widget is not None:
+        if isinstance(widget, QTableWidget):
+            return widget
+        parent = widget.parentWidget()
+        widget = parent if isinstance(parent, QWidget) else None
+    return None
+
+
+def _install_table_copy_shortcut(table: QTableWidget) -> None:
+    shortcut = QShortcut(QKeySequence.StandardKey.Copy, table)
+    shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+    shortcut.activated.connect(lambda: _copy_table_to_clipboard(table))
+    table._asteroidfinder_copy_shortcut = shortcut  # type: ignore[attr-defined]
+
+
+def _unique_track_count(rows: list[dict[str, str]]) -> int:
+    ids = {row.get("track_id", "").strip() for row in rows if row.get("track_id", "").strip()}
+    return len(ids) if ids else len(rows)
+
+
+def _parse_frame_time(value: str | None) -> Time | None:
+    if not value:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    for kwargs in ({"format": "isot", "scale": "utc"}, {"scale": "utc"}):
+        try:
+            return Time(text, **kwargs)
+        except Exception:
+            continue
+    return None
+
+
+def _frame_time(frames: list[FrameInfo], frame_index: int) -> Time | None:
+    if frame_index < 0 or frame_index >= len(frames):
+        return None
+    return _parse_frame_time(frames[frame_index].date_obs)
+
+
+def _prediction_rows(
+    track: Track,
+    frames: list[FrameInfo],
+    *,
+    start_after: float,
+    duration: float,
+    step: float,
+) -> list[list[str]]:
+    detections = sorted(track.detections, key=lambda item: item.frame_index)
+    if len(detections) < 2:
+        return [["", "", "", "", "", "", "", "Need at least two detections to predict a path"]]
+
+    times = [_frame_time(frames, det.frame_index) for det in detections]
+    has_times = all(time is not None for time in times)
+    if has_times:
+        base_time = times[0]
+        assert base_time is not None
+        t_values = np.array([(time.jd - base_time.jd) * 1440.0 for time in times if time is not None], dtype=float)
+        last_time = times[-1]
+        assert last_time is not None
+        unit = "min"
+    else:
+        base_time = None
+        last_time = None
+        t_values = np.array([float(det.frame_index) for det in detections], dtype=float)
+        unit = "frame"
+
+    xs = np.array([float(det.source.x) for det in detections], dtype=float)
+    ys = np.array([float(det.source.y) for det in detections], dtype=float)
+    fit_x = np.polyfit(t_values, xs, 1)
+    fit_y = np.polyfit(t_values, ys, 1)
+    residual = np.hypot(xs - np.polyval(fit_x, t_values), ys - np.polyval(fit_y, t_values))
+    rms_px = float(np.sqrt(np.mean(residual**2))) if len(residual) else 0.0
+
+    ra_fit: np.ndarray | None = None
+    dec_fit: np.ndarray | None = None
+    if all(det.ra_deg is not None and det.dec_deg is not None for det in detections):
+        ra_values = np.rad2deg(np.unwrap(np.deg2rad([float(det.ra_deg) for det in detections])))
+        dec_values = np.array([float(det.dec_deg) for det in detections], dtype=float)
+        ra_fit = np.polyfit(t_values, ra_values, 1)
+        dec_fit = np.polyfit(t_values, dec_values, 1)
+
+    step_value = max(float(step), 0.1)
+    first_offset = max(float(start_after), 0.0)
+    last_offset = max(first_offset, float(duration))
+    offsets = np.arange(first_offset, last_offset + step_value * 0.5, step_value)
+    last_t = float(t_values[-1])
+    rows: list[list[str]] = []
+    for offset in offsets:
+        t = last_t + float(offset)
+        pred_x = float(np.polyval(fit_x, t))
+        pred_y = float(np.polyval(fit_y, t))
+        if has_times and last_time is not None:
+            utc = Time(last_time.jd + float(offset) / 1440.0, format="jd", scale="utc").isot
+            offset_text = f"+{offset:.1f} min"
+        else:
+            utc = f"frame {t:.2f}"
+            offset_text = f"+{offset:.1f} frame"
+        if ra_fit is not None and dec_fit is not None:
+            ra = float(np.polyval(ra_fit, t)) % 360.0
+            dec = float(np.polyval(dec_fit, t))
+            ra_text = f"{ra:.7f}"
+            dec_text = f"{dec:.7f}"
+        else:
+            ra_text = ""
+            dec_text = ""
+        note = "time-based linear fit" if has_times else "no DATE-OBS; frame-index prediction only"
+        if unit == "min" and offset > 180:
+            note += "; orbit fit recommended"
+        rows.append([offset_text, utc, ra_text, dec_text, f"{pred_x:.2f}", f"{pred_y:.2f}", f"{rms_px:.3f}", note])
+    return rows
+
+
+def _known_residual_rows(
+    track: Track,
+    frames: list[FrameInfo],
+    known_objects: list[KnownObject],
+    matched: KnownObject,
+) -> list[list[str]]:
+    detections = sorted(track.detections, key=lambda item: item.frame_index)
+    if not detections:
+        return [["", "", "", "", "", "", "", "", "", "", "", "No measured detections"]]
+    rows: list[list[str]] = []
+    target_identity = _known_identity(matched)
+    for det in detections:
+        if det.frame_index >= len(frames):
+            rows.append([str(det.frame_index), "", "", "", f"{det.source.x:.2f}", f"{det.source.y:.2f}", "", "", "", "", "", "No frame"])
+            continue
+        frame = frames[det.frame_index]
+        predicted = _matching_known_object_for_detection(
+            known_objects,
+            target_identity,
+            Path(frame.path),
+            det.frame_index,
+            det.source.x,
+            det.source.y,
+        )
+        utc = frame.date_obs or ""
+        actual_ra = "" if det.ra_deg is None else f"{det.ra_deg:.7f}"
+        actual_dec = "" if det.dec_deg is None else f"{det.dec_deg:.7f}"
+        if predicted is None:
+            rows.append(
+                [
+                    str(det.frame_index),
+                    utc,
+                    "",
+                    "",
+                    f"{det.source.x:.2f}",
+                    f"{det.source.y:.2f}",
+                    "",
+                    "",
+                    "",
+                    "",
+                    actual_ra,
+                    actual_dec,
+                ]
+            )
+            continue
+        delta_px = float(((det.source.x - predicted.x) ** 2 + (det.source.y - predicted.y) ** 2) ** 0.5)
+        if det.ra_deg is None or det.dec_deg is None:
+            delta_arcsec = ""
+        else:
+            delta_arcsec = f"{_angular_separation_arcsec(predicted.ra_deg, predicted.dec_deg, det.ra_deg, det.dec_deg):.2f}"
+        rows.append(
+            [
+                str(det.frame_index),
+                utc,
+                f"{predicted.x:.2f}",
+                f"{predicted.y:.2f}",
+                f"{det.source.x:.2f}",
+                f"{det.source.y:.2f}",
+                f"{delta_px:.2f}",
+                delta_arcsec,
+                f"{predicted.ra_deg:.7f}",
+                f"{predicted.dec_deg:.7f}",
+                actual_ra,
+                actual_dec,
+            ]
+        )
+    return rows
+
+
+def _known_identity(obj: KnownObject) -> str:
+    for value in (obj.number, obj.name):
+        text = str(value).strip()
+        if text:
+            return text.lower()
+    return f"{obj.ra_deg:.6f}:{obj.dec_deg:.6f}"
+
+
+def _matching_known_object_for_detection(
+    objects: list[KnownObject],
+    target_identity: str,
+    frame_path: Path,
+    frame_index: int,
+    measured_x: float,
+    measured_y: float,
+) -> KnownObject | None:
+    candidates = [
+        obj
+        for obj in _known_objects_matching_frame(objects, frame_path, frame_index)
+        if _known_identity(obj) == target_identity
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda obj: (obj.x - measured_x) ** 2 + (obj.y - measured_y) ** 2)
+
+
+def _angular_separation_arcsec(ra1: float, dec1: float, ra2: float, dec2: float) -> float:
+    dra = ((ra2 - ra1 + 180.0) % 360.0) - 180.0
+    dec_mid = np.deg2rad((dec1 + dec2) / 2.0)
+    dra_arcsec = dra * np.cos(dec_mid) * 3600.0
+    ddec_arcsec = (dec2 - dec1) * 3600.0
+    return float(np.hypot(dra_arcsec, ddec_arcsec))
 
 
 def _linear_fit(values: list[tuple[float, float]]) -> tuple[float, float]:
@@ -1982,6 +2447,7 @@ class DiagnosticWindow(QDialog):
         self.measurement_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.measurement_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.measurement_table.itemSelectionChanged.connect(self._measurement_selection_changed)
+        _install_table_copy_shortcut(self.measurement_table)
 
         self.tabs = QTabWidget()
         self.tabs.addTab(chart_tab, "Motion")
@@ -2267,6 +2733,259 @@ class CutoutWindow(QDialog):
         self._grid.addStretch(1)
 
 
+class PredictionWindow(QDialog):
+    """Prediction/residual table for measured moving-object tracks."""
+
+    def __init__(
+        self,
+        tracks: list[Track],
+        frames: list[FrameInfo],
+        *,
+        start_index: int = 0,
+        known_matches: dict[int, str] | None = None,
+        known_objects: list[KnownObject] | None = None,
+        matched_known_objects: dict[int, KnownObject] | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.tracks = tracks
+        self.frames = frames
+        self.known_matches = known_matches or {}
+        self.known_objects = known_objects or []
+        self.matched_known_objects = matched_known_objects or {}
+        self.index = min(max(start_index, 0), max(len(tracks) - 1, 0))
+        self.setWindowTitle("Prediction And Residuals")
+        self.resize(1040, 640)
+        layout = QVBoxLayout(self)
+        controls = QHBoxLayout()
+        previous = _icon_button("◀", "Previous track")
+        previous.clicked.connect(lambda: self._step_track(-1))
+        next_button = _icon_button("▶", "Next track")
+        next_button.clicked.connect(lambda: self._step_track(1))
+        self.caption = QLabel()
+        self.caption.setObjectName("MutedText")
+        controls.addWidget(previous)
+        controls.addWidget(next_button)
+        controls.addWidget(self.caption, 1)
+        layout.addLayout(controls)
+
+        settings = QHBoxLayout()
+        self.start_after = _double_spin(5.0, 0.0, 10080.0, 1.0)
+        self.start_after.setDecimals(1)
+        self.duration = _double_spin(120.0, 1.0, 10080.0, 5.0)
+        self.duration.setDecimals(1)
+        self.step_minutes = _double_spin(10.0, 0.5, 1440.0, 1.0)
+        self.step_minutes.setDecimals(1)
+        for widget in (self.start_after, self.duration, self.step_minutes):
+            widget.valueChanged.connect(lambda *_: self._render())
+        settings.addWidget(QLabel("Start after last"))
+        settings.addWidget(self.start_after)
+        settings.addWidget(QLabel("Duration"))
+        settings.addWidget(self.duration)
+        settings.addWidget(QLabel("Step"))
+        settings.addWidget(self.step_minutes)
+        settings.addStretch(1)
+        layout.addLayout(settings)
+
+        self.note = QLabel()
+        self.note.setWordWrap(True)
+        self.note.setObjectName("MutedText")
+        layout.addWidget(self.note)
+
+        self.table = QTableWidget(0, 8)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.copy_shortcut = QShortcut(QKeySequence.StandardKey.Copy, self)
+        self.copy_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self.copy_shortcut.activated.connect(lambda: _copy_table_to_clipboard(self.table))
+        layout.addWidget(self.table, 1)
+        self._render()
+
+    def _step_track(self, delta: int) -> None:
+        if not self.tracks:
+            return
+        self.index = (self.index + delta) % len(self.tracks)
+        self._render()
+
+    def _render(self) -> None:
+        if not self.tracks:
+            self.caption.setText("No tracks")
+            self.table.setRowCount(0)
+            return
+        track = self.tracks[self.index]
+        known = self.known_matches.get(self.index, "")
+        known_text = f"   known match: {known}" if known else "   unknown candidate"
+        speed = "unknown" if track.angular_rate_arcsec_per_frame is None else f"{track.angular_rate_arcsec_per_frame:.3f} arcsec/frame"
+        self.caption.setText(
+            f"AF{self.index + 1:04d}{known_text}   {len(track.detections)} detections   speed {speed}   score {track.score:.3f}"
+        )
+        matched = self.matched_known_objects.get(self.index)
+        if matched is not None:
+            self.note.setText(
+                "Known-object residuals: predicted positions come from the SkyBoT/MPC motion cache; "
+                "actual positions are your measured track centroids."
+            )
+            self.table.setColumnCount(12)
+            self.table.setHorizontalHeaderLabels(
+                [
+                    "Frame",
+                    "UTC",
+                    "Pred X",
+                    "Pred Y",
+                    "Actual X",
+                    "Actual Y",
+                    "Delta px",
+                    "Delta arcsec",
+                    "Pred RA",
+                    "Pred Dec",
+                    "Actual RA",
+                    "Actual Dec",
+                ]
+            )
+            stretch_column = 1
+            rows = _known_residual_rows(track, self.frames, self.known_objects, matched)
+        else:
+            self.note.setText(
+                "Unknown-candidate short-arc prediction from measured centroids. Good for near-term pointing checks; "
+                "not a real orbit solution for next-night recovery."
+            )
+            self.table.setColumnCount(8)
+            self.table.setHorizontalHeaderLabels(["Offset", "UTC / frame", "RA deg", "Dec deg", "X", "Y", "RMS px", "Notes"])
+            stretch_column = 7
+            rows = _prediction_rows(
+                track,
+                self.frames,
+                start_after=float(self.start_after.value()),
+                duration=float(self.duration.value()),
+                step=float(self.step_minutes.value()),
+            )
+        for column in range(self.table.columnCount()):
+            self.table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(stretch_column, QHeaderView.ResizeMode.Stretch)
+        self.table.setRowCount(len(rows))
+        for row, values in enumerate(rows):
+            for column, value in enumerate(values):
+                self.table.setItem(row, column, QTableWidgetItem(value))
+
+
+class SubmissionWindow(QDialog):
+    """Review detected tracks and write measured MPC/ADES submission drafts."""
+
+    def __init__(
+        self,
+        tracks: list[Track],
+        known_matches: dict[int, str],
+        *,
+        observatory_code: str,
+        output_dir: Path,
+        export_callback: Any,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.tracks = tracks
+        self.known_matches = known_matches
+        self.output_dir = output_dir
+        self.export_callback = export_callback
+        self.checkboxes: list[QCheckBox] = []
+        self.setWindowTitle("Submission Review")
+        self.resize(1080, 680)
+        layout = QVBoxLayout(self)
+
+        note = QLabel(
+            "Exports measured track centroids from your frames. Known matches are labels for review; "
+            "the exported positions are measured, not copied from predictions."
+        )
+        note.setWordWrap(True)
+        note.setObjectName("MutedText")
+        layout.addWidget(note)
+
+        controls = QHBoxLayout()
+        self.observatory = QLineEdit(observatory_code or "500")
+        self.observatory.setMaximumWidth(90)
+        self.prefix = QLineEdit("AF")
+        self.prefix.setMaximumWidth(70)
+        self.format_combo = QComboBox()
+        self.format_combo.addItems(["Both", "MPC", "ADES"])
+        controls.addWidget(QLabel("Observatory"))
+        controls.addWidget(self.observatory)
+        controls.addWidget(QLabel("Track prefix"))
+        controls.addWidget(self.prefix)
+        controls.addWidget(QLabel("Format"))
+        controls.addWidget(self.format_combo)
+        controls.addStretch(1)
+        select_all = QPushButton("Select All")
+        select_all.clicked.connect(lambda: self._set_all(True))
+        select_none = QPushButton("Select None")
+        select_none.clicked.connect(lambda: self._set_all(False))
+        controls.addWidget(select_all)
+        controls.addWidget(select_none)
+        layout.addLayout(controls)
+
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(["Use", "Track", "Known match", "Hits", "Speed", "PA", "Score"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        _install_table_copy_shortcut(self.table)
+        layout.addWidget(self.table, 1)
+        self._populate()
+
+        buttons = QHBoxLayout()
+        copy_button = QPushButton("Copy Table")
+        copy_button.clicked.connect(lambda: _copy_table_to_clipboard(self.table))
+        open_folder = QPushButton("Open Output Folder")
+        open_folder.clicked.connect(lambda: webbrowser.open(self.output_dir.resolve().as_uri()))
+        export_button = QPushButton("Export Selected")
+        export_button.clicked.connect(self._export_selected)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.close)
+        buttons.addWidget(copy_button)
+        buttons.addWidget(open_folder)
+        buttons.addStretch(1)
+        buttons.addWidget(export_button)
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+
+    def _populate(self) -> None:
+        self.table.setRowCount(len(self.tracks))
+        self.checkboxes = []
+        for row, track in enumerate(self.tracks):
+            checkbox = QCheckBox()
+            checkbox.setChecked(True)
+            checkbox.setToolTip("Include this measured track in the export")
+            self.checkboxes.append(checkbox)
+            self.table.setCellWidget(row, 0, checkbox)
+            speed = "" if track.angular_rate_arcsec_per_frame is None else f"{track.angular_rate_arcsec_per_frame:.3f}"
+            pa = "" if track.position_angle_deg is None else f"{track.position_angle_deg:.1f}"
+            values = [
+                f"AF{row + 1:04d}",
+                self.known_matches.get(row, "unknown"),
+                str(len(track.detections)),
+                speed,
+                pa,
+                f"{track.score:.3f}",
+            ]
+            for column, value in enumerate(values, start=1):
+                self.table.setItem(row, column, QTableWidgetItem(value))
+
+    def _set_all(self, checked: bool) -> None:
+        for checkbox in self.checkboxes:
+            checkbox.setChecked(checked)
+
+    def _selected_indices(self) -> list[int]:
+        return [index for index, checkbox in enumerate(self.checkboxes) if checkbox.isChecked()]
+
+    def _export_selected(self) -> None:
+        self.export_callback(
+            self._selected_indices(),
+            observatory_code=self.observatory.text().strip() or "500",
+            object_prefix=self.prefix.text().strip() or "AF",
+            export_format=self.format_combo.currentText(),
+        )
+
+
 class KnownObjectsWindow(QDialog):
     def __init__(self, objects: list[KnownObject], parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -2281,8 +3000,6 @@ class KnownObjectsWindow(QDialog):
         self.table = _table_widget(rows)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         layout.addWidget(self.table, 1)
-        self.copy_shortcut = QShortcut(QKeySequence.StandardKey.Copy, self.table)
-        self.copy_shortcut.activated.connect(self._copy_selected)
         controls = QHBoxLayout()
         close_button = QPushButton("Close")
         close_button.clicked.connect(self.close)
@@ -2290,20 +3007,6 @@ class KnownObjectsWindow(QDialog):
         controls.addWidget(close_button)
         layout.addLayout(controls)
         self.table.setFocus()
-
-    def _copy_selected(self) -> None:
-        rows = sorted({index.row() for index in self.table.selectedIndexes()})
-        if not rows:
-            return
-        headers = [self.table.horizontalHeaderItem(column).text() for column in range(self.table.columnCount())]
-        lines = ["\t".join(headers)]
-        for row in rows:
-            values = []
-            for column in range(self.table.columnCount()):
-                item = self.table.item(row, column)
-                values.append("" if item is None else item.text())
-            lines.append("\t".join(values))
-        QApplication.clipboard().setText("\n".join(lines))
 
 
 class ReportWindow(QDialog):
@@ -2367,7 +3070,7 @@ class ReportWindow(QDialog):
         hotpix = _read_csv_file(out_dir / "hot_pixel_report.csv")
 
         metrics = [
-            ("Detected tracks", str(len(tracks)), "#38bdf8"),
+            ("Detected tracks", str(_unique_track_count(tracks)), "#38bdf8"),
             ("Known objects", str(len(known)), "#34d399"),
             ("Aligned frames", str(len(alignment)), "#a78bfa"),
             ("Hot pixel frames", str(len(hotpix)), "#fbbf24"),
@@ -2404,10 +3107,19 @@ class ReportWindow(QDialog):
 
 
 class QaWindow(QDialog):
-    def __init__(self, title: str, csv_path: Path, folder: Path, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        title: str,
+        csv_path: Path,
+        folder: Path,
+        *,
+        mask_controls: bool,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self.csv_path = csv_path
         self.folder = folder
+        self.mask_controls = mask_controls
         self.image_paths: list[Path] = []
         self.image_list = QListWidget()
         self.image_label = QLabel()
@@ -2429,8 +3141,9 @@ class QaWindow(QDialog):
         self.color_mask.toggled.connect(self._select_current_image)
         controls.addWidget(QLabel(str(csv_path)))
         controls.addStretch(1)
-        controls.addWidget(self.color_mask)
-        controls.addWidget(self.invert_mask)
+        if mask_controls:
+            controls.addWidget(self.color_mask)
+            controls.addWidget(self.invert_mask)
         controls.addWidget(refresh)
         controls.addWidget(open_folder)
         layout.addLayout(controls)
@@ -2555,7 +3268,9 @@ def _table_widget(rows: list[dict[str, str]]) -> QTableWidget:
     table.setHorizontalHeaderLabels(headers)
     table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
     table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+    table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
     for row_index, row in enumerate(rows):
         for col_index, header in enumerate(headers):
             table.setItem(row_index, col_index, QTableWidgetItem(row.get(header, "")))
+    _install_table_copy_shortcut(table)
     return table

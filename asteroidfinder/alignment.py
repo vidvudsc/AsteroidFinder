@@ -16,6 +16,36 @@ from .detection import detect_sources
 from .io import AstroImage, load_image, save_fits
 
 
+_FRAME_METADATA_KEYS = (
+    "DATE-OBS",
+    "DATEOBS",
+    "DATE",
+    "TIME-OBS",
+    "UT",
+    "UTC-OBS",
+    "OBSJD",
+    "JD",
+    "JULDATE",
+    "MJD-OBS",
+    "MJD",
+    "EXPTIME",
+    "EXPOSURE",
+    "FILTER",
+    "FILTERID",
+    "OBJECT",
+    "OBJCTRA",
+    "OBJCTDEC",
+    "RA",
+    "DEC",
+    "IMAGETYP",
+    "XBINNING",
+    "YBINNING",
+    "GAIN",
+    "OFFSET",
+    "AIRMASS",
+)
+
+
 @dataclass(frozen=True)
 class AlignedFrame:
     image: AstroImage
@@ -82,9 +112,29 @@ def align_images(
         if progress_callback is not None:
             progress_callback(total, total, "Writing aligned FITS files")
         for frame in result:
-            save_fits(frame.data, out_dir / f"{frame.image.path.stem}_aligned.fits", reference_image.header)
+            header = _aligned_output_header(frame.image.header, reference_image.header)
+            save_fits(frame.data, out_dir / f"{frame.image.path.stem}_aligned.fits", header)
         write_alignment_qa(result, out_dir / "alignment_qa.csv")
     return result
+
+
+def _aligned_output_header(frame_header: object | None, reference_header: object | None) -> object | None:
+    """Use reference WCS for aligned pixels while preserving per-frame metadata."""
+
+    if reference_header is None:
+        return frame_header.copy() if hasattr(frame_header, "copy") else None
+    header = reference_header.copy()
+    if frame_header is None:
+        return header
+    for key in _FRAME_METADATA_KEYS:
+        if key not in frame_header:
+            continue
+        header[key] = frame_header[key]
+        try:
+            header.comments[key] = frame_header.comments[key]
+        except Exception:
+            pass
+    return header
 
 
 def write_alignment_qa(frames: Sequence[AlignedFrame], path: str | Path) -> Path:

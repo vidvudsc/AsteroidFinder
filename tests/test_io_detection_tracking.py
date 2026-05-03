@@ -393,6 +393,37 @@ def test_detected_track_mpc_export_uses_measured_track(tmp_path: Path) -> None:
     assert ",calibrated_magzp," in rows[1]
 
 
+def test_alignment_outputs_preserve_per_frame_observation_time(tmp_path: Path) -> None:
+    paths = _synthetic_wcs_sequence(tmp_path)
+    out_dir = tmp_path / "aligned"
+
+    align_images(paths, output_dir=out_dir)
+
+    aligned_paths = [out_dir / f"{path.stem}_aligned.fits" for path in paths]
+    original_dates = [fits.getheader(path)["DATE-OBS"] for path in paths]
+    aligned_dates = [fits.getheader(path)["DATE-OBS"] for path in aligned_paths]
+    assert aligned_dates == original_dates
+    assert fits.getheader(aligned_paths[1])["CTYPE1"] == "RA---TAN"
+
+    anchor = KnownObject(
+        frame=aligned_paths[0],
+        date_obs="2026-01-01T00:00:00.000",
+        number="1",
+        name="TestAst",
+        object_type="asteroid",
+        ra_deg=100.0,
+        dec_deg=20.0,
+        x=60.0,
+        y=60.0,
+        v_mag=18.0,
+        center_distance_arcsec=None,
+        ra_rate_arcsec_per_hour=36.0,
+        dec_rate_arcsec_per_hour=0.0,
+    )
+    predicted = predict_known_objects_for_frames([anchor], aligned_paths)
+    assert predicted[2].x != predicted[0].x
+
+
 def test_track_diagnostics_writes_png_and_summary(tmp_path: Path) -> None:
     paths = _synthetic_wcs_sequence(tmp_path)
     tracks = track_moving_objects(paths, sigma=5, min_detections=3)

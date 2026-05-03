@@ -42,11 +42,15 @@ def measured_observations_from_tracks(
     *,
     observatory_code: str,
     object_prefix: str = "AF",
+    track_ids: Sequence[int] | None = None,
 ) -> list[DetectedTrackObservation]:
     """Convert detected moving-object tracks into measured astrometric observations."""
 
     observations: list[DetectedTrackObservation] = []
-    for track_id, track in enumerate(tracks, start=1):
+    ids = list(track_ids) if track_ids is not None else list(range(1, len(tracks) + 1))
+    if len(ids) != len(tracks):
+        raise ValueError("track_ids must match the number of tracks")
+    for track_id, track in zip(ids, tracks):
         for detection in track.detections:
             frame = aligned_frames[detection.frame_index]
             header = frame.image.header
@@ -147,6 +151,7 @@ def write_detected_track_mpc(
     observatory_code: str,
     object_prefix: str = "AF",
     csv_path: str | Path | None = None,
+    track_ids: Sequence[int] | None = None,
 ) -> Path:
     """Write measured detected-track observations as an MPC-style draft.
 
@@ -161,6 +166,7 @@ def write_detected_track_mpc(
         aligned_frames,
         observatory_code=observatory_code,
         object_prefix=object_prefix,
+        track_ids=track_ids,
     )
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -242,6 +248,7 @@ def write_detected_track_ades(
     *,
     observatory_code: str,
     object_prefix: str = "AF",
+    track_ids: Sequence[int] | None = None,
 ) -> Path:
     """Write measured detected-track observations in ADES (PSV) format.
 
@@ -255,6 +262,7 @@ def write_detected_track_ades(
         aligned_frames,
         observatory_code=observatory_code,
         object_prefix=object_prefix,
+        track_ids=track_ids,
     )
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)

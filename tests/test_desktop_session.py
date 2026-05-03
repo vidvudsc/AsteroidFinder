@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import os
 
@@ -8,8 +9,10 @@ from PySide6.QtCore import QEvent, Qt
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import QApplication
 
+from asteroidfinder.detection import Source
 from asteroidfinder.io import save_fits
 from asteroidfinder.known_objects import KnownObject
+from asteroidfinder.tracking import Track, TrackDetection
 from asteroidfinder_desktop.main_window import (
     ANALYSIS_PANEL_WIDTH,
     MainWindow,
@@ -130,6 +133,27 @@ def test_known_object_overlay_falls_back_to_frame_order() -> None:
     matches = _known_objects_matching_frame([first, second], Path("raw/not-the-same-name.fit"), 1)
 
     assert matches == [second]
+
+
+def test_known_object_track_match_uses_frame_order_and_hides_duplicate_overlay(tmp_path: Path) -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.session.frames = [
+        FrameInfo(path=str(tmp_path / "raw_1.fit")),
+        FrameInfo(path=str(tmp_path / "raw_2.fit")),
+    ]
+    first = replace(_known_object(Path("solved/a-solveinput.new")), name="First", x=10.0, y=20.0)
+    second = replace(_known_object(Path("solved/b-solveinput.new")), name="Second", x=42.0, y=43.0)
+    detection = TrackDetection(1, Source(x=42.5, y=43.5, flux=100.0, a=1.0, b=1.0, theta=0.0, snr=9.0))
+    window.known_objects = [first, second]
+    window.tracks = [Track(detections=(detection,), velocity_x=0.0, velocity_y=0.0, score=1.0)]
+
+    window._match_known_objects_to_tracks(radius_px=5.0)
+    window._current_frame_index = 1
+
+    assert window.track_known_matches == {0: "Second"}
+    assert window._known_objects_for_current_frame() == []
 
 
 def test_initial_progress_totals_for_slow_desktop_steps() -> None:
