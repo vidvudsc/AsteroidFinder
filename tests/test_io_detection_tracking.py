@@ -4,6 +4,8 @@ from pathlib import Path
 
 import numpy as np
 from astropy.io import fits
+from astropy.table import Table
+import requests
 
 from asteroidfinder.alignment import align_images
 from asteroidfinder.calibration import build_persistent_hot_pixel_mask, calibrate_images_with_persistent_hot_pixels, remove_hot_pixels
@@ -11,6 +13,7 @@ from asteroidfinder.diagnostics import plot_track_diagnostics
 from asteroidfinder.doctor import recommend_index_series, run_doctor
 from asteroidfinder.detection import detect_sources
 from asteroidfinder.io import load_image, save_fits
+from asteroidfinder import known_objects as known_object_module
 from asteroidfinder.known_objects import KnownObject, predict_known_objects_for_frames
 from asteroidfinder.mpc import write_detected_track_mpc
 from asteroidfinder.photometry import aperture_photometry
@@ -490,6 +493,77 @@ def test_known_object_prediction_uses_rates_without_requery(tmp_path: Path) -> N
     assert len(predicted) == 3
     assert [obj.frame for obj in predicted] == paths
     assert predicted[2].x != predicted[0].x
+
+
+def test_known_object_query_retries_skybot_http_500(tmp_path: Path, monkeypatch) -> None:
+    from astroquery.imcce import Skybot
+
+    path = _synthetic_wcs_sequence(tmp_path)[0]
+    calls = []
+
+    def fake_cone_search(*args, **kwargs):
+        calls.append(kwargs.get("cache"))
+        if len(calls) == 1:
+            response = requests.Response()
+            response.status_code = 500
+            raise requests.exceptions.HTTPError("500 Server Error", response=response)
+        return Table(
+            {
+                "Number": ["123"],
+                "Name": ["RetryAst"],
+                "Type": ["MB"],
+                "RA": [100.0],
+                "DEC": [20.0],
+                "V": [18.0],
+                "centerdist": [0.0],
+                "RA_rate": [36.0],
+                "DEC_rate": [0.0],
+            }
+        )
+
+    monkeypatch.setattr(Skybot, "cone_search", fake_cone_search)
+    monkeypatch.setattr(known_object_module.time, "sleep", lambda *_: None)
+
+    objects = known_object_module.query_known_objects_in_frame(path)
+
+    assert len(objects) == 1
+    assert objects[0].name == "RetryAst"
+    assert calls == [True, False]
+
+
+def test_known_object_motion_cache_tries_alternate_anchor_after_server_error(tmp_path: Path, monkeypatch) -> None:
+    paths = _synthetic_wcs_sequence(tmp_path)
+    calls = []
+
+    def fake_query(path: Path, **kwargs):
+        calls.append(Path(path))
+        if len(calls) == 1:
+            raise known_object_module.KnownObjectQueryError("SkyBoT server error")
+        return [
+            KnownObject(
+                frame=Path(path),
+                date_obs="2026-01-01T00:00:00.000",
+                number="1",
+                name="FallbackAst",
+                object_type="asteroid",
+                ra_deg=100.0,
+                dec_deg=20.0,
+                x=60.0,
+                y=60.0,
+                v_mag=18.0,
+                center_distance_arcsec=None,
+                ra_rate_arcsec_per_hour=36.0,
+                dec_rate_arcsec_per_hour=0.0,
+            )
+        ]
+
+    monkeypatch.setattr(known_object_module, "query_known_objects_in_frame", fake_query)
+
+    predicted = known_object_module.query_known_objects_with_motion_cache(paths, anchor_index=1)
+
+    assert calls[:2] == [paths[1], paths[0]]
+    assert len(predicted) == 3
+    assert {obj.name for obj in predicted} == {"FallbackAst"}
 
 
 def _synthetic_wcs_sequence(tmp_path: Path) -> list[Path]:

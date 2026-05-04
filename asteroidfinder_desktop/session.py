@@ -35,6 +35,9 @@ class PipelineSettings:
     detect_sigma: float = 4.0
     min_detections: int = 3
     observatory_code: str = "500"
+    observer_lat_deg: float | None = None
+    observer_lon_deg: float | None = None
+    observer_elev_m: float | None = None
 
 
 @dataclass

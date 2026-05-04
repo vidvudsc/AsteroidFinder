@@ -21,8 +21,10 @@ from asteroidfinder_desktop.main_window import (
     _image_metadata,
     _import_status_text,
     _initial_progress_total,
+    _known_residual_rows,
     _known_objects_matching_frame,
     _progress_bar_text,
+    _read_observer_from_header,
 )
 from asteroidfinder_desktop.session import FrameInfo, SessionState, discover_fits_files, filter_image_files, load_session, save_session
 from asteroidfinder_desktop.viewer import FitsViewer, _display_luminance
@@ -154,6 +156,37 @@ def test_known_object_track_match_uses_frame_order_and_hides_duplicate_overlay(t
 
     assert window.track_known_matches == {0: "Second"}
     assert window._known_objects_for_current_frame() == []
+
+
+def test_observer_header_detection_accepts_ztf_keywords() -> None:
+    from astropy.io import fits
+
+    header = fits.Header()
+    header["OBSLAT"] = 33.3573
+    header["OBSLON"] = -116.8598
+    header["OBSALT"] = 1668.0
+
+    lat, lon, elev, mpc = _read_observer_from_header(header)
+
+    assert lat == 33.3573
+    assert lon == -116.8598
+    assert elev == 1668.0
+    assert mpc is None
+
+
+def test_known_residual_rows_include_signed_observed_minus_calculated_components() -> None:
+    frame = FrameInfo(path="frame.fit", date_obs="2026-01-01T00:00:00")
+    predicted = replace(_known_object(Path("frame.fit")), number="123", ra_deg=10.0, dec_deg=20.0, x=50.0, y=50.0)
+    source = Source(x=51.0, y=52.0, flux=100.0, a=1.0, b=1.0, theta=0.0, snr=10.0)
+    detection = TrackDetection(0, source, ra_deg=10.001, dec_deg=20.002)
+    track = Track(detections=(detection,), velocity_x=0.0, velocity_y=0.0, score=1.0)
+
+    rows = _known_residual_rows(track, [frame], [predicted], predicted)
+
+    assert len(rows[0]) == 14
+    assert float(rows[0][7]) > 0.0
+    assert float(rows[0][8]) > 0.0
+    assert float(rows[0][9]) > float(rows[0][7])
 
 
 def test_initial_progress_totals_for_slow_desktop_steps() -> None:

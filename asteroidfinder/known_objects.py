@@ -4,13 +4,15 @@ from dataclasses import dataclass
 from dataclasses import replace
 from pathlib import Path
 from typing import Sequence
+import time
 
 import astropy.units as u
 import numpy as np
-from astropy.coordinates import SkyCoord
+from astropy.coordinates import EarthLocation, SkyCoord
 from astropy.io import fits
 from astropy.time import Time
 from astropy.wcs import WCS
+import requests
 
 from .detection import Source
 from .io import load_image
@@ -43,11 +45,16 @@ class KnownObjectPhotometry:
     background: float
 
 
+class KnownObjectQueryError(RuntimeError):
+    """Raised when the remote known-object service fails after retries."""
+
+
 def query_known_objects_in_frame(
     path: str | Path,
     *,
     location: str = "500",
     only_inside: bool = True,
+    observer_location: "EarthLocation | None" = None,
 ) -> list[KnownObject]:
     """Query IMCCE SkyBoT for known solar-system objects expected in a solved frame."""
 
@@ -69,12 +76,18 @@ def query_known_objects_in_frame(
 
     height, width = image.data.shape
     center, radius = _frame_center_radius(wcs, width, height)
-    table = Skybot.cone_search(center, radius, observation_time, location=location)
+    table = _skybot_cone_search_with_retry(Skybot, center, radius, observation_time, location=location)
 
+    has_geodist = "geodist" in table.colnames
+    apply_parallax = observer_location is not None and location == "500" and has_geodist
     objects: list[KnownObject] = []
     for row in table:
         ra = _float(row["RA"])
         dec = _float(row["DEC"])
+        if apply_parallax:
+            geodist_au = _optional_float(row["geodist"])
+            if geodist_au is not None and geodist_au > 0:
+                ra, dec = _geocentric_to_topocentric(ra, dec, geodist_au, observation_time, observer_location)
         x, y = wcs.world_to_pixel_values(ra, dec)
         if only_inside and not (0 <= x < width and 0 <= y < height):
             continue
@@ -103,10 +116,15 @@ def query_known_objects_for_frames(
     *,
     location: str = "500",
     only_inside: bool = True,
+    observer_location: "EarthLocation | None" = None,
 ) -> list[KnownObject]:
     objects: list[KnownObject] = []
     for path in paths:
-        objects.extend(query_known_objects_in_frame(path, location=location, only_inside=only_inside))
+        objects.extend(
+            query_known_objects_in_frame(
+                path, location=location, only_inside=only_inside, observer_location=observer_location
+            )
+        )
     return objects
 
 
@@ -116,6 +134,7 @@ def query_known_objects_with_motion_cache(
     location: str = "500",
     only_inside: bool = True,
     anchor_index: int | None = None,
+    observer_location: "EarthLocation | None" = None,
 ) -> list[KnownObject]:
     """Query SkyBoT once, then propagate expected positions to all frames.
 
@@ -128,8 +147,21 @@ def query_known_objects_with_motion_cache(
     if not frame_paths:
         return []
     anchor = min(max(anchor_index if anchor_index is not None else len(frame_paths) // 2, 0), len(frame_paths) - 1)
-    anchor_objects = query_known_objects_in_frame(frame_paths[anchor], location=location, only_inside=only_inside)
-    return predict_known_objects_for_frames(anchor_objects, frame_paths, only_inside=only_inside)
+    errors: list[str] = []
+    for candidate_anchor in _anchor_search_order(len(frame_paths), anchor):
+        try:
+            anchor_objects = query_known_objects_in_frame(
+                frame_paths[candidate_anchor],
+                location=location,
+                only_inside=only_inside,
+                observer_location=observer_location,
+            )
+        except KnownObjectQueryError as exc:
+            errors.append(f"{frame_paths[candidate_anchor].name}: {exc}")
+            continue
+        return predict_known_objects_for_frames(anchor_objects, frame_paths, only_inside=only_inside)
+    error_text = "; ".join(errors[-3:]) if errors else "no query attempts were made"
+    raise KnownObjectQueryError(f"SkyBoT known-object lookup failed for all anchor frames: {error_text}")
 
 
 def predict_known_objects_for_frames(
@@ -169,6 +201,63 @@ def predict_known_objects_for_frames(
                 )
             )
     return predicted
+
+
+def _skybot_cone_search_with_retry(
+    skybot: object,
+    center: SkyCoord,
+    radius: u.Quantity,
+    observation_time: Time,
+    *,
+    location: str,
+    attempts: int = 3,
+    delay_seconds: float = 0.75,
+) -> object:
+    last_error: BaseException | None = None
+    for attempt in range(max(1, attempts)):
+        try:
+            return skybot.cone_search(
+                center,
+                radius,
+                observation_time,
+                location=location,
+                cache=(attempt == 0),
+            )
+        except requests.exceptions.HTTPError as exc:
+            last_error = exc
+            status_code = exc.response.status_code if exc.response is not None else None
+            if status_code is not None and status_code < 500:
+                raise KnownObjectQueryError(f"SkyBoT rejected the query: {_query_error_text(exc)}") from exc
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            last_error = exc
+
+        if attempt < attempts - 1:
+            time.sleep(delay_seconds * (attempt + 1))
+
+    raise KnownObjectQueryError(f"SkyBoT server did not answer cleanly after {attempts} attempts: {_query_error_text(last_error)}")
+
+
+def _anchor_search_order(count: int, preferred: int) -> list[int]:
+    if count <= 0:
+        return []
+    candidates = [preferred, 0, count - 1, count // 2]
+    order: list[int] = []
+    for index in candidates:
+        bounded = min(max(index, 0), count - 1)
+        if bounded not in order:
+            order.append(bounded)
+    return order
+
+
+def _query_error_text(error: BaseException | None) -> str:
+    if error is None:
+        return "unknown error"
+    if isinstance(error, requests.exceptions.HTTPError):
+        response = error.response
+        status = "" if response is None else f"HTTP {response.status_code}"
+        reason = str(error)
+        return " ".join(part for part in (status, reason) if part).strip()
+    return str(error)
 
 
 def write_known_objects_csv(objects: Sequence[KnownObject], path: str | Path) -> Path:
@@ -328,6 +417,38 @@ def _observation_time(header: fits.Header) -> Time | None:
             except Exception:
                 pass
     return None
+
+
+def _geocentric_to_topocentric(
+    ra_deg: float,
+    dec_deg: float,
+    distance_au: float,
+    obstime: Time,
+    observer: EarthLocation,
+) -> tuple[float, float]:
+    """Shift a geocentric RA/Dec to topocentric using diurnal parallax.
+
+    SkyBoT with location=500 returns geocentric apparent positions. For a
+    surface observer this can be off by several arcseconds (Earth radius /
+    target distance). Subtracting the observer's GCRS position gives the
+    direction the asteroid is actually seen from the telescope.
+    """
+
+    try:
+        target = SkyCoord(
+            ra=ra_deg * u.deg,
+            dec=dec_deg * u.deg,
+            distance=distance_au * u.au,
+            frame="gcrs",
+            obstime=obstime,
+        )
+        obs_gcrs = observer.get_gcrs(obstime=obstime)
+        topo_cart = target.cartesian - obs_gcrs.cartesian
+        topo = SkyCoord(topo_cart, frame="gcrs", obstime=obstime, representation_type="cartesian")
+        topo.representation_type = "spherical"
+        return float(topo.ra.deg) % 360.0, float(topo.dec.deg)
+    except Exception:
+        return ra_deg, dec_deg
 
 
 def _propagate_radec(obj: KnownObject, observation_time: Time) -> tuple[float, float]:

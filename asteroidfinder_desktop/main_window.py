@@ -8,9 +8,11 @@ from time import perf_counter
 import webbrowser
 
 import numpy as np
+from astropy.coordinates import EarthLocation
 from astropy.io import fits
 from astropy.time import Time
 from astropy.wcs import WCS
+import astropy.units as u
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
 from PySide6.QtCore import QRectF, QThreadPool, QTimer, Qt
@@ -67,6 +69,78 @@ from .workers import FunctionWorker
 
 ANALYSIS_PANEL_WIDTH = 380
 WORKFLOW_PANEL_WIDTH = 320
+
+
+def _parse_optional_float(text: str) -> float | None:
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+_LAT_KEYS = ("SITELAT", "OBS-LAT", "OBSLAT", "OBSGEO-B", "LATITUDE", "LAT-OBS", "TEL_LAT")
+_LON_KEYS = ("SITELONG", "OBS-LONG", "OBSLON", "OBSGEO-L", "LONGITUD", "LONG-OBS", "TEL_LONG")
+_ELEV_KEYS = ("SITEELEV", "OBS-ELEV", "OBSALT", "OBSGEO-H", "ELEVATIO", "ELEV-OBS", "ALTITUDE", "TEL_ELEV")
+_MPC_KEYS = ("MPC-CODE", "MPCCODE", "OBSCODE", "MPC_CODE")
+
+
+def _read_observer_from_header(header: fits.Header) -> tuple[float | None, float | None, float | None, str | None]:
+    def first(keys: tuple[str, ...]) -> Any:
+        for key in keys:
+            value = header.get(key)
+            if value not in (None, ""):
+                return value
+        return None
+
+    def parse_angle(value: Any) -> float | None:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value).strip()
+        try:
+            return float(text)
+        except ValueError:
+            pass
+        try:
+            from astropy.coordinates import Angle
+            return float(Angle(text, unit=u.deg).deg)
+        except Exception:
+            return None
+
+    def parse_float(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    lat_raw = first(_LAT_KEYS)
+    lon_raw = first(_LON_KEYS)
+    elev_raw = first(_ELEV_KEYS)
+    mpc_raw = first(_MPC_KEYS)
+
+    lat = parse_angle(lat_raw)
+    lon = parse_angle(lon_raw)
+    elev = parse_float(elev_raw)
+    mpc = str(mpc_raw).strip() if mpc_raw not in (None, "") else None
+    return lat, lon, elev, mpc
+
+
+def _build_observer_location(settings: Any) -> EarthLocation | None:
+    lat = settings.observer_lat_deg
+    lon = settings.observer_lon_deg
+    if lat is None or lon is None:
+        return None
+    elev = settings.observer_elev_m if settings.observer_elev_m is not None else 0.0
+    try:
+        return EarthLocation(lat=lat * u.deg, lon=lon * u.deg, height=elev * u.m)
+    except Exception:
+        return None
 
 
 class WorkflowStepDialog(QDialog):
@@ -434,7 +508,38 @@ class MainWindow(QMainWindow):
         self.session.frames = [self._frame_info(path) for path in paths]
         self._populate_frames()
         self._log(_import_status_text(len(paths), skipped))
+        self._auto_detect_observer_from_headers(paths)
         self._show_frame(0, keep_view=False)
+
+    def _auto_detect_observer_from_headers(self, paths: list[Path]) -> None:
+        settings = self.session.settings
+        already_have_loc = settings.observer_lat_deg is not None and settings.observer_lon_deg is not None
+        already_have_code = bool(settings.observatory_code) and settings.observatory_code != "500"
+        if already_have_loc and already_have_code:
+            return
+        for path in paths:
+            try:
+                with fits.open(path, memmap=False) as hdul:
+                    header = hdul[0].header
+            except Exception:
+                continue
+            lat, lon, elev, mpc = _read_observer_from_header(header)
+            if not already_have_loc and lat is not None and lon is not None:
+                settings.observer_lat_deg = lat
+                settings.observer_lon_deg = lon
+                if elev is not None:
+                    settings.observer_elev_m = elev
+                self._log(
+                    f"Detected observer location from FITS header: lat={lat:.4f}°, lon={lon:.4f}°"
+                    + (f", elev={elev:.0f}m" if elev is not None else "")
+                )
+                already_have_loc = True
+            if not already_have_code and mpc:
+                settings.observatory_code = mpc
+                self._log(f"Detected MPC observatory code from FITS header: {mpc}")
+                already_have_code = True
+            if already_have_loc and already_have_code:
+                break
 
     def choose_output_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Choose output folder", self.session.output_dir or str(Path.home()))
@@ -513,10 +618,28 @@ class MainWindow(QMainWindow):
 
     def _open_known_objects_dialog(self) -> None:
         observatory = QLineEdit(self.session.settings.observatory_code)
-        dlg = WorkflowStepDialog("Identify Known Objects", [("Observatory code", observatory)], self)
+        lat = QLineEdit("" if self.session.settings.observer_lat_deg is None else f"{self.session.settings.observer_lat_deg:.5f}")
+        lon = QLineEdit("" if self.session.settings.observer_lon_deg is None else f"{self.session.settings.observer_lon_deg:.5f}")
+        elev = QLineEdit("" if self.session.settings.observer_elev_m is None else f"{self.session.settings.observer_elev_m:.0f}")
+        lat.setPlaceholderText("e.g. 56.95 (used only if observatory code is 500)")
+        lon.setPlaceholderText("e.g. 24.10 (east positive)")
+        elev.setPlaceholderText("meters above sea level")
+        dlg = WorkflowStepDialog(
+            "Identify Known Objects",
+            [
+                ("Observatory code", observatory),
+                ("Observer latitude (deg)", lat),
+                ("Observer longitude (deg)", lon),
+                ("Observer elevation (m)", elev),
+            ],
+            self,
+        )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         self.session.settings.observatory_code = observatory.text().strip() or "500"
+        self.session.settings.observer_lat_deg = _parse_optional_float(lat.text())
+        self.session.settings.observer_lon_deg = _parse_optional_float(lon.text())
+        self.session.settings.observer_elev_m = _parse_optional_float(elev.text())
         self.query_known_objects()
 
     def _open_export_dialog(self) -> None:
@@ -654,9 +777,16 @@ class MainWindow(QMainWindow):
         if not paths:
             return
         location = self.session.settings.observatory_code or "500"
+        observer = _build_observer_location(self.session.settings)
+        if location == "500" and observer is None:
+            self._log(
+                "Known-object query is geocentric (loc=500) — set observer lat/lon to remove parallax (~3-5\")."
+            )
 
         def query() -> list[KnownObject]:
-            objects = query_known_objects_with_motion_cache(paths, location=location)
+            objects = query_known_objects_with_motion_cache(
+                paths, location=location, observer_location=observer
+            )
             write_known_objects_csv(objects, self._output_dir() / "known_objects.csv")
             return objects
 
@@ -2092,12 +2222,12 @@ def _known_residual_rows(
 ) -> list[list[str]]:
     detections = sorted(track.detections, key=lambda item: item.frame_index)
     if not detections:
-        return [["", "", "", "", "", "", "", "", "", "", "", "No measured detections"]]
+        return [["", "", "", "", "", "", "", "", "", "", "", "", "", "No measured detections"]]
     rows: list[list[str]] = []
     target_identity = _known_identity(matched)
     for det in detections:
         if det.frame_index >= len(frames):
-            rows.append([str(det.frame_index), "", "", "", f"{det.source.x:.2f}", f"{det.source.y:.2f}", "", "", "", "", "", "No frame"])
+            rows.append([str(det.frame_index), "", "", "", f"{det.source.x:.2f}", f"{det.source.y:.2f}", "", "", "", "", "", "", "", "No frame"])
             continue
         frame = frames[det.frame_index]
         predicted = _matching_known_object_for_detection(
@@ -2124,6 +2254,8 @@ def _known_residual_rows(
                     "",
                     "",
                     "",
+                    "",
+                    "",
                     actual_ra,
                     actual_dec,
                 ]
@@ -2131,9 +2263,19 @@ def _known_residual_rows(
             continue
         delta_px = float(((det.source.x - predicted.x) ** 2 + (det.source.y - predicted.y) ** 2) ** 0.5)
         if det.ra_deg is None or det.dec_deg is None:
+            ra_residual = ""
+            dec_residual = ""
             delta_arcsec = ""
         else:
-            delta_arcsec = f"{_angular_separation_arcsec(predicted.ra_deg, predicted.dec_deg, det.ra_deg, det.dec_deg):.2f}"
+            ra_arcsec, dec_arcsec, total_arcsec = _signed_sky_residual_arcsec(
+                predicted.ra_deg,
+                predicted.dec_deg,
+                det.ra_deg,
+                det.dec_deg,
+            )
+            ra_residual = f"{ra_arcsec:.2f}"
+            dec_residual = f"{dec_arcsec:.2f}"
+            delta_arcsec = f"{total_arcsec:.2f}"
         rows.append(
             [
                 str(det.frame_index),
@@ -2143,6 +2285,8 @@ def _known_residual_rows(
                 f"{det.source.x:.2f}",
                 f"{det.source.y:.2f}",
                 f"{delta_px:.2f}",
+                ra_residual,
+                dec_residual,
                 delta_arcsec,
                 f"{predicted.ra_deg:.7f}",
                 f"{predicted.dec_deg:.7f}",
@@ -2180,11 +2324,21 @@ def _matching_known_object_for_detection(
 
 
 def _angular_separation_arcsec(ra1: float, dec1: float, ra2: float, dec2: float) -> float:
-    dra = ((ra2 - ra1 + 180.0) % 360.0) - 180.0
-    dec_mid = np.deg2rad((dec1 + dec2) / 2.0)
-    dra_arcsec = dra * np.cos(dec_mid) * 3600.0
-    ddec_arcsec = (dec2 - dec1) * 3600.0
-    return float(np.hypot(dra_arcsec, ddec_arcsec))
+    return _signed_sky_residual_arcsec(ra1, dec1, ra2, dec2)[2]
+
+
+def _signed_sky_residual_arcsec(
+    predicted_ra: float,
+    predicted_dec: float,
+    actual_ra: float,
+    actual_dec: float,
+) -> tuple[float, float, float]:
+    dra = ((actual_ra - predicted_ra + 180.0) % 360.0) - 180.0
+    dec_mid = np.deg2rad((predicted_dec + actual_dec) / 2.0)
+    ra_arcsec = dra * np.cos(dec_mid) * 3600.0
+    dec_arcsec = (actual_dec - predicted_dec) * 3600.0
+    total_arcsec = float(np.hypot(ra_arcsec, dec_arcsec))
+    return float(ra_arcsec), float(dec_arcsec), total_arcsec
 
 
 def _linear_fit(values: list[tuple[float, float]]) -> tuple[float, float]:
@@ -2823,10 +2977,10 @@ class PredictionWindow(QDialog):
         matched = self.matched_known_objects.get(self.index)
         if matched is not None:
             self.note.setText(
-                "Known-object residuals: predicted positions come from the SkyBoT/MPC motion cache; "
-                "actual positions are your measured track centroids."
+                "Known-object O-C residuals: observed measured centroids minus calculated SkyBoT/MPC positions. "
+                "Signed RA/Dec residuals show the error direction; total delta is the scalar separation."
             )
-            self.table.setColumnCount(12)
+            self.table.setColumnCount(14)
             self.table.setHorizontalHeaderLabels(
                 [
                     "Frame",
@@ -2836,6 +2990,8 @@ class PredictionWindow(QDialog):
                     "Actual X",
                     "Actual Y",
                     "Delta px",
+                    "O-C RA arcsec",
+                    "O-C Dec arcsec",
                     "Delta arcsec",
                     "Pred RA",
                     "Pred Dec",
