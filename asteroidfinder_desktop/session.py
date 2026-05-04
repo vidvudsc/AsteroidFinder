@@ -33,6 +33,9 @@ class PipelineSettings:
     scale_high: float | None = None
     hot_sigma: float = 8.0
     detect_sigma: float = 4.0
+    track_link_radius: float = 8.0
+    fast_track_link_radius: float = 120.0
+    fast_tracking_retry: bool = True
     min_detections: int = 3
     observatory_code: str = "500"
     observer_lat_deg: float | None = None

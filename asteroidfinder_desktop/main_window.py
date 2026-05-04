@@ -607,16 +607,30 @@ class MainWindow(QMainWindow):
 
     def _open_tracking_dialog(self) -> None:
         detect_sigma = _double_spin(self.session.settings.detect_sigma, 1.0, 20.0, 0.25)
+        link_radius = _double_spin(self.session.settings.track_link_radius, 1.0, 500.0, 1.0)
+        link_radius.setDecimals(1)
+        link_radius.setToolTip("Maximum motion between adjacent frames for the normal tracker pass, in pixels.")
+        fast_link_radius = _double_spin(self.session.settings.fast_track_link_radius, 1.0, 1000.0, 5.0)
+        fast_link_radius.setDecimals(1)
+        fast_link_radius.setToolTip("Fallback maximum motion when the normal pass finds no tracks.")
+        fast_retry = QCheckBox("Retry with fast-mover radius if normal search finds nothing")
+        fast_retry.setChecked(self.session.settings.fast_tracking_retry)
         min_detections = QSpinBox()
         min_detections.setRange(2, 20)
         min_detections.setValue(self.session.settings.min_detections)
         dlg = WorkflowStepDialog("Detect Movers", [
             ("Detect sigma", detect_sigma),
+            ("Max motion px/frame", link_radius),
+            ("Fast max motion px/frame", fast_link_radius),
+            ("Fast fallback", fast_retry),
             ("Min detections", min_detections),
         ], self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         self.session.settings.detect_sigma = detect_sigma.value()
+        self.session.settings.track_link_radius = link_radius.value()
+        self.session.settings.fast_track_link_radius = fast_link_radius.value()
+        self.session.settings.fast_tracking_retry = fast_retry.isChecked()
         self.session.settings.min_detections = min_detections.value()
         self.run_tracking()
 
@@ -759,18 +773,51 @@ class MainWindow(QMainWindow):
         aligned_dir = self._output_dir() / "aligned"
         assume_aligned = bool(paths) and all(Path(path).parent == aligned_dir for path in paths)
 
-        def detect(progress_callback: object | None = None) -> list[Track]:
+        def detect(progress_callback: object | None = None) -> dict[str, object]:
+            if callable(progress_callback):
+                progress_callback(0, 2, f"Normal search radius {self.session.settings.track_link_radius:.0f}px/frame")
             tracks = track_moving_objects(
                 paths,
                 sigma=self.session.settings.detect_sigma,
+                link_radius=self.session.settings.track_link_radius,
                 min_detections=self.session.settings.min_detections,
                 assume_aligned=assume_aligned,
                 max_sources=500,
             )
+            if callable(progress_callback):
+                progress_callback(1, 2, f"Normal search found {len(tracks)} track(s)")
+            used_radius = self.session.settings.track_link_radius
+            normal_count = len(tracks)
+            if (
+                not tracks
+                and self.session.settings.fast_tracking_retry
+                and self.session.settings.fast_track_link_radius > self.session.settings.track_link_radius
+            ):
+                if callable(progress_callback):
+                    progress_callback(
+                        1,
+                        2,
+                        f"Fast retry radius {self.session.settings.fast_track_link_radius:.0f}px/frame",
+                    )
+                tracks = track_moving_objects(
+                    paths,
+                    sigma=self.session.settings.detect_sigma,
+                    link_radius=self.session.settings.fast_track_link_radius,
+                    min_detections=self.session.settings.min_detections,
+                    assume_aligned=assume_aligned,
+                    max_sources=500,
+                )
+                if tracks:
+                    used_radius = self.session.settings.fast_track_link_radius
             write_tracks_csv(tracks, self._layout().tracks_csv)
             if callable(progress_callback):
-                progress_callback(1, 1, f"Detected {len(tracks)} track(s)")
-            return tracks
+                progress_callback(2, 2, f"Detected {len(tracks)} track(s)")
+            return {
+                "tracks": tracks,
+                "link_radius": used_radius,
+                "normal_count": normal_count,
+                "fast_retry_used": used_radius != self.session.settings.track_link_radius,
+            }
 
         self._start_worker(
             "tracking",
@@ -918,10 +965,29 @@ class MainWindow(QMainWindow):
             tracks = track_moving_objects(
                 aligned_paths,
                 sigma=self.session.settings.detect_sigma,
+                link_radius=self.session.settings.track_link_radius,
                 min_detections=self.session.settings.min_detections,
                 assume_aligned=True,
                 max_sources=500,
             )
+            used_radius = self.session.settings.track_link_radius
+            normal_count = len(tracks)
+            if (
+                not tracks
+                and self.session.settings.fast_tracking_retry
+                and self.session.settings.fast_track_link_radius > self.session.settings.track_link_radius
+            ):
+                progress(2, 3, f"Retrying fast movers at {self.session.settings.fast_track_link_radius:.0f}px/frame")
+                tracks = track_moving_objects(
+                    aligned_paths,
+                    sigma=self.session.settings.detect_sigma,
+                    link_radius=self.session.settings.fast_track_link_radius,
+                    min_detections=self.session.settings.min_detections,
+                    assume_aligned=True,
+                    max_sources=500,
+                )
+                if tracks:
+                    used_radius = self.session.settings.fast_track_link_radius
             write_tracks_csv(tracks, layout.tracks_csv)
             progress(3, 3, f"Detected {len(tracks)} track(s)")
             return {
@@ -929,6 +995,8 @@ class MainWindow(QMainWindow):
                 "aligned_frames": aligned_frames,
                 "aligned_paths": aligned_paths,
                 "tracks": tracks,
+                "tracking_link_radius": used_radius,
+                "tracking_normal_count": normal_count,
             }
 
         self._start_worker(
@@ -1134,7 +1202,19 @@ class MainWindow(QMainWindow):
                 self._populate_frames()
                 self._show_frame(0, keep_view=False)
         elif name == "tracking":
-            self.tracks = list(result)  # type: ignore[arg-type]
+            data = result if isinstance(result, dict) else {}
+            tracks = data.get("tracks", result)
+            self.tracks = list(tracks)  # type: ignore[arg-type]
+            if data:
+                radius = data.get("link_radius")
+                normal_count = data.get("normal_count")
+                if data.get("fast_retry_used"):
+                    self._log(
+                        f"Fast-mover retry found {len(self.tracks)} track(s) "
+                        f"after normal search found {normal_count}; radius={float(radius):.0f}px/frame"
+                    )
+                elif radius is not None:
+                    self._log(f"Tracking radius used: {float(radius):.0f}px/frame")
             self.visible_track_indices = {0} if self.tracks else set()
             self._match_known_objects_to_tracks()
             self._populate_tracks()
@@ -1152,6 +1232,16 @@ class MainWindow(QMainWindow):
             self._populate_tracks()
             self._log_hot_pixel_qa()
             self._log_alignment_qa()
+            if data.get("tracking_link_radius") is not None:
+                radius = float(data["tracking_link_radius"])
+                normal_count = int(data.get("tracking_normal_count", len(self.tracks)))
+                if radius != self.session.settings.track_link_radius:
+                    self._log(
+                        f"Fast-mover retry found {len(self.tracks)} track(s) "
+                        f"after normal search found {normal_count}; radius={radius:.0f}px/frame"
+                    )
+                else:
+                    self._log(f"Tracking radius used: {radius:.0f}px/frame")
             for completed in ("calibration", "alignment", "tracking"):
                 self._mark_workflow_done(completed)
         elif name == "alignment":

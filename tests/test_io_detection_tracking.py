@@ -312,6 +312,29 @@ def test_track_moving_object_can_skip_alignment_for_aligned_sequence(tmp_path: P
     assert tracks[0].detections[0].photometry is not None
 
 
+def test_track_moving_object_fast_link_radius_finds_fast_mover(tmp_path: Path) -> None:
+    paths = []
+    yy, xx = np.indices((260, 260))
+    for frame in range(4):
+        image = np.zeros((260, 260), dtype=np.float32) + 20
+        moving_x = 30 + frame * 60
+        moving_y = 55 + frame * 18
+        image += 700 * np.exp(-((xx - moving_x) ** 2 + (yy - moving_y) ** 2) / 5)
+        path = tmp_path / f"fast_{frame}.fits"
+        save_fits(image, path)
+        paths.append(path)
+
+    slow_tracks = track_moving_objects(paths, sigma=5, min_detections=3, assume_aligned=True, link_radius=8)
+    fast_tracks = track_moving_objects(paths, sigma=5, min_detections=3, assume_aligned=True, link_radius=90)
+
+    assert slow_tracks == []
+    assert fast_tracks
+    best = fast_tracks[0]
+    assert len(best.detections) == 4
+    assert abs(best.velocity_x - 60) < 2
+    assert abs(best.velocity_y - 18) < 2
+
+
 def test_align_images_uses_wcs_reprojection_when_available(tmp_path: Path) -> None:
     paths = _synthetic_wcs_sequence(tmp_path)
 

@@ -93,6 +93,8 @@ def test_session_round_trip(tmp_path: Path) -> None:
     assert loaded.output_dir == state.output_dir
     assert loaded.frames[0].name == "frame.fits"
     assert loaded.frames[0].has_wcs
+    assert loaded.settings.track_link_radius == 8.0
+    assert loaded.settings.fast_tracking_retry is True
 
 
 def test_raw_bayer_preview_uses_same_size_luminance() -> None:
