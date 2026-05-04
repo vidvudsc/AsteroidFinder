@@ -54,11 +54,12 @@ from PySide6.QtWidgets import (
 from asteroidfinder.alignment import align_images
 from asteroidfinder.astrometry_quality import run_gaia_astrometry_quality
 from asteroidfinder.calibration import calibrate_images_with_persistent_hot_pixels
-from asteroidfinder.diagnostics import plot_track_diagnostics
+from asteroidfinder.diagnostics import write_track_diagnostic_outputs
 from asteroidfinder.io import load_image
 from asteroidfinder.known_objects import KnownObject, query_known_objects_with_motion_cache, write_known_objects_csv
 from asteroidfinder.mpc import write_detected_track_ades, write_detected_track_mpc
-from asteroidfinder.platesolve import solve_image
+from asteroidfinder.outputs import OutputLayout, output_layout
+from asteroidfinder.platesolve import solve_image, write_plate_solutions_csv
 from asteroidfinder.report import generate_html_report
 from asteroidfinder.tracking import Track, track_moving_objects
 from asteroidfinder.workflow import write_tracks_csv
@@ -684,6 +685,7 @@ class MainWindow(QMainWindow):
             calibrate_images_with_persistent_hot_pixels,
             paths,
             output_dir=out_dir,
+            diagnostic_dir=self._hot_pixel_qa_dir(),
             hot_sigma=self.session.settings.hot_sigma,
         )
 
@@ -692,11 +694,13 @@ class MainWindow(QMainWindow):
         if not paths:
             return
         self._sync_settings()
-        out_dir = self._output_dir() / "solved"
+        layout = self._layout()
+        out_dir = layout.solved_dir
         timeout = getattr(self, "_solve_timeout", 300)
 
         def solve_all(progress_callback: object | None = None) -> list[Path]:
             solved = []
+            solutions = []
             total = len(paths)
             for index, path in enumerate(paths, start=1):
                 if callable(progress_callback):
@@ -709,9 +713,11 @@ class MainWindow(QMainWindow):
                     scale_high=self.session.settings.scale_high,
                     timeout=timeout,
                 )
+                solutions.append(result)
                 solved.append(result.solved_fits or result.path)
                 if callable(progress_callback):
                     progress_callback(index, total, f"Solved {Path(path).name}")
+            write_plate_solutions_csv(solutions, layout.plate_solve_csv)
             return solved
 
         self._start_worker("plate solve", solve_all)
@@ -741,6 +747,7 @@ class MainWindow(QMainWindow):
             align_images,
             paths,
             output_dir=aligned_dir,
+            qa_path=self._alignment_qa_path(),
             crop_overlap=crop_overlap,
             prefer_translation=False,
         )
@@ -760,7 +767,7 @@ class MainWindow(QMainWindow):
                 assume_aligned=assume_aligned,
                 max_sources=500,
             )
-            write_tracks_csv(tracks, self._output_dir() / "tracks.csv")
+            write_tracks_csv(tracks, self._layout().tracks_csv)
             if callable(progress_callback):
                 progress_callback(1, 1, f"Detected {len(tracks)} track(s)")
             return tracks
@@ -777,7 +784,16 @@ class MainWindow(QMainWindow):
         if not self.tracks:
             self._error("No tracks", "Run tracking before writing PNG diagnostics.")
             return
-        self._start_worker("PNG diagnostics", plot_track_diagnostics, self.tracks, self._output_dir() / "diagnostics")
+        paths = self._require_paths(prefer_aligned=True)
+        if not paths:
+            return
+        self._start_worker(
+            "PNG diagnostics",
+            write_track_diagnostic_outputs,
+            self.tracks,
+            self._layout().track_diagnostics_dir,
+            frame_paths=paths,
+        )
 
     def open_or_generate_movement_graph(self) -> None:
         if not self.tracks:
@@ -803,7 +819,7 @@ class MainWindow(QMainWindow):
             objects = query_known_objects_with_motion_cache(
                 paths, location=location, observer_location=observer
             )
-            write_known_objects_csv(objects, self._output_dir() / "known_objects.csv")
+            write_known_objects_csv(objects, self._layout().known_objects_csv)
             return objects
 
         self._start_worker("known objects", query)
@@ -862,8 +878,9 @@ class MainWindow(QMainWindow):
             return
 
         out_dir = self._output_dir()
-        calibrated_dir = out_dir / "calibrated"
-        aligned_dir = out_dir / "aligned"
+        layout = self._layout()
+        calibrated_dir = layout.calibrated_dir
+        aligned_dir = layout.aligned_dir
         crop_overlap = getattr(self, "_alignment_crop", True)
 
         def full_pipeline(progress_callback: object | None = None) -> dict[str, object]:
@@ -875,6 +892,7 @@ class MainWindow(QMainWindow):
             calibration = calibrate_images_with_persistent_hot_pixels(
                 paths,
                 output_dir=calibrated_dir,
+                diagnostic_dir=layout.hot_pixel_qa_dir,
                 hot_sigma=self.session.settings.hot_sigma,
             )
             calibrated_paths = [
@@ -887,6 +905,7 @@ class MainWindow(QMainWindow):
             aligned_frames = align_images(
                 calibrated_paths,
                 output_dir=aligned_dir,
+                qa_path=layout.alignment_qa_csv,
                 crop_overlap=crop_overlap,
                 prefer_translation=False,
             )
@@ -903,7 +922,7 @@ class MainWindow(QMainWindow):
                 assume_aligned=True,
                 max_sources=500,
             )
-            write_tracks_csv(tracks, out_dir / "tracks.csv")
+            write_tracks_csv(tracks, layout.tracks_csv)
             progress(3, 3, f"Detected {len(tracks)} track(s)")
             return {
                 "calibration": calibration,
@@ -924,9 +943,9 @@ class MainWindow(QMainWindow):
         paths = self._require_paths(prefer_aligned=True)
         if not paths:
             return
-        out_dir = self._output_dir()
-        mpc_path = out_dir / "detected_track_mpc.txt"
-        csv_path = out_dir / "detected_track_observations.csv"
+        layout = self._layout()
+        mpc_path = layout.detected_track_mpc
+        csv_path = layout.detected_track_observations_csv
         observatory = self.session.settings.observatory_code or "500"
 
         def export() -> Path:
@@ -951,8 +970,7 @@ class MainWindow(QMainWindow):
         paths = self._require_paths(prefer_aligned=True)
         if not paths:
             return
-        out_dir = self._output_dir()
-        ades_path = out_dir / "detected_track_ades.psv"
+        ades_path = self._layout().detected_track_ades
         observatory = self.session.settings.observatory_code or "500"
 
         def export() -> Path:
@@ -986,7 +1004,7 @@ class MainWindow(QMainWindow):
             return
         self.session.settings.observatory_code = observatory_code.strip() or "500"
         prefix = object_prefix.strip() or "AF"
-        out_dir = self._output_dir()
+        layout = self._layout()
         selected_tracks = [self.tracks[index] for index in selected]
         track_ids = [index + 1 for index in selected]
 
@@ -1001,10 +1019,10 @@ class MainWindow(QMainWindow):
                     write_detected_track_mpc(
                         selected_tracks,
                         frames,
-                        out_dir / "submission_mpc.txt",
+                        layout.submission_mpc,
                         observatory_code=self.session.settings.observatory_code,
                         object_prefix=prefix,
-                        csv_path=out_dir / "submission_observations.csv",
+                        csv_path=layout.submission_observations_csv,
                         track_ids=track_ids,
                     )
                 )
@@ -1013,7 +1031,7 @@ class MainWindow(QMainWindow):
                     write_detected_track_ades(
                         selected_tracks,
                         frames,
-                        out_dir / "submission_ades.psv",
+                        layout.submission_ades,
                         observatory_code=self.session.settings.observatory_code,
                         object_prefix=prefix,
                         track_ids=track_ids,
@@ -1147,7 +1165,8 @@ class MainWindow(QMainWindow):
                 self._populate_frames()
                 self._show_frame(0, keep_view=False)
         elif name == "plate solve":
-            self._log(f"Solved FITS written to {self._output_dir() / 'solved'}")
+            self._log(f"Plate solve QA written to {self._layout().plate_solve_csv}")
+            self._log(f"Solved FITS written to {self._layout().solved_dir}")
             solved_paths = [Path(path) for path in result] if isinstance(result, list) else []
             if solved_paths:
                 self.session.frames = [self._frame_info(path) for path in solved_paths]
@@ -1164,7 +1183,7 @@ class MainWindow(QMainWindow):
             self._draw_checked_tracks()
         elif name == "PNG diagnostics":
             paths = [Path(path) for path in result] if isinstance(result, list) else []
-            self._log(f"PNG diagnostics written: {len(paths)} file(s) in {self._output_dir() / 'diagnostics'}")
+            self._log(f"PNG diagnostics written: {len(paths)} file(s) in {self._layout().track_diagnostics_dir}")
         elif name == "submission export":
             paths = [Path(path) for path in result] if isinstance(result, list) else []
             self._log("Submission files written: " + ", ".join(path.name for path in paths))
@@ -1337,10 +1356,14 @@ class MainWindow(QMainWindow):
         self._open_png_diagnostic_window(start_index=start_index)
 
     def _open_png_diagnostic_window(self, *, start_index: int = 0) -> None:
-        diagnostics_dir = self._output_dir() / "diagnostics"
+        diagnostics_dir = self._layout().track_diagnostics_dir
         paths = natural_sorted(diagnostics_dir.glob("track_*_diagnostic.png"))
         if len(paths) < len(self.tracks):
-            paths = plot_track_diagnostics(self.tracks, diagnostics_dir)
+            frame_paths = self._require_paths(prefer_aligned=True)
+            if not frame_paths:
+                return
+            written = write_track_diagnostic_outputs(self.tracks, diagnostics_dir, frame_paths=frame_paths)
+            paths = natural_sorted(path for path in written if path.name.endswith("_diagnostic.png"))
         if not paths:
             self._error("No diagnostics", "Run tracking before opening movement charts.")
             return
@@ -1420,13 +1443,13 @@ class MainWindow(QMainWindow):
             self._qa_windows.remove(window)
 
     def _hot_pixel_qa_dir(self) -> Path:
-        return self._output_dir() / "calibrated" / "hot_pixel_qa"
+        return self._layout().hot_pixel_qa_dir
 
     def _alignment_qa_path(self) -> Path:
-        return self._output_dir() / "aligned" / "alignment_qa.csv"
+        return self._layout().alignment_qa_csv
 
     def _astrometry_qa_dir(self) -> Path:
-        return self._output_dir() / "astrometry_qa"
+        return self._layout().astrometry_qa_dir
 
     def _astrometry_qa_path(self) -> Path:
         return self._astrometry_qa_dir() / "astrometry_qa.csv"
@@ -1670,10 +1693,13 @@ class MainWindow(QMainWindow):
     def _clear_generated_aligned_outputs(self, aligned_dir: Path) -> None:
         aligned_dir.mkdir(parents=True, exist_ok=True)
         for path in aligned_dir.glob("*"):
-            if path.is_file() and (path.name.endswith("_aligned.fits") or path.name == "alignment_qa.csv"):
+            if path.is_file() and path.name.endswith("_aligned.fits"):
                 path.unlink()
             elif path.is_dir() and path.name == "diagnostics":
                 shutil.rmtree(path)
+        qa_path = self._alignment_qa_path()
+        if qa_path.exists():
+            qa_path.unlink()
 
     def _shape_groups(self, paths: list[Path]) -> dict[tuple[int, int], list[Path]]:
         groups: dict[tuple[int, int], list[Path]] = {}
@@ -1694,6 +1720,9 @@ class MainWindow(QMainWindow):
         output = Path(self.session.output_dir)
         output.mkdir(parents=True, exist_ok=True)
         return output
+
+    def _layout(self) -> OutputLayout:
+        return output_layout(self._output_dir())
 
     def _sync_settings(self) -> None:
         pass
@@ -3254,15 +3283,32 @@ class ReportWindow(QDialog):
     def _load_report(self) -> None:
         self.tabs.clear()
         out_dir = self.path.parent
+        layout = output_layout(out_dir)
         self.tabs.addTab(self._summary_tab(out_dir), "Overview")
-        for title, filename in [
-            ("Tracks", "tracks.csv"),
-            ("Known Objects", "known_objects.csv"),
-            ("Alignment", "alignment_report.csv"),
-            ("Hot Pixels", "hot_pixel_report.csv"),
-            ("Photometry", "known_object_forced_photometry.csv"),
+        for title, paths in [
+            ("Tracks", [layout.tracks_csv, out_dir / "tracks.csv"]),
+            ("Known Objects", [layout.known_objects_csv, out_dir / "known_objects.csv"]),
+            ("Plate Solve", [layout.plate_solve_csv]),
+            ("Alignment", [layout.alignment_qa_csv, out_dir / "aligned" / "alignment_qa.csv", out_dir / "alignment_report.csv"]),
+            (
+                "Hot Pixels",
+                [
+                    layout.hot_pixel_qa_dir / "hot_pixel_summary.csv",
+                    out_dir / "calibrated" / "hot_pixel_qa" / "hot_pixel_summary.csv",
+                    out_dir / "hot_pixel_report.csv",
+                ],
+            ),
+            ("Astrometry", [layout.astrometry_qa_dir / "astrometry_qa.csv", out_dir / "astrometry_qa" / "astrometry_qa.csv"]),
+            (
+                "Export",
+                [
+                    layout.submission_observations_csv,
+                    layout.detected_track_observations_csv,
+                    out_dir / "known_object_forced_photometry.csv",
+                ],
+            ),
         ]:
-            rows = _read_csv_file(out_dir / filename)
+            rows = _read_first_csv_file(paths)
             if rows:
                 self.tabs.addTab(_table_widget(rows), f"{title} ({len(rows)})")
         self.tabs.addTab(self._files_tab(out_dir), "Files")
@@ -3273,14 +3319,25 @@ class ReportWindow(QDialog):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(8)
 
-        tracks = _read_csv_file(out_dir / "tracks.csv")
-        known = _read_csv_file(out_dir / "known_objects.csv")
-        alignment = _read_csv_file(out_dir / "alignment_report.csv")
-        hotpix = _read_csv_file(out_dir / "hot_pixel_report.csv")
+        layout_obj = output_layout(out_dir)
+        tracks = _read_first_csv_file([layout_obj.tracks_csv, out_dir / "tracks.csv"])
+        known = _read_first_csv_file([layout_obj.known_objects_csv, out_dir / "known_objects.csv"])
+        plate = _read_first_csv_file([layout_obj.plate_solve_csv])
+        alignment = _read_first_csv_file(
+            [layout_obj.alignment_qa_csv, out_dir / "aligned" / "alignment_qa.csv", out_dir / "alignment_report.csv"]
+        )
+        hotpix = _read_first_csv_file(
+            [
+                layout_obj.hot_pixel_qa_dir / "hot_pixel_summary.csv",
+                out_dir / "calibrated" / "hot_pixel_qa" / "hot_pixel_summary.csv",
+                out_dir / "hot_pixel_report.csv",
+            ]
+        )
 
         metrics = [
             ("Detected tracks", str(_unique_track_count(tracks)), "#38bdf8"),
             ("Known objects", str(len(known)), "#34d399"),
+            ("Plate solved", str(len(plate)), "#60a5fa"),
             ("Aligned frames", str(len(alignment)), "#a78bfa"),
             ("Hot pixel frames", str(len(hotpix)), "#fbbf24"),
         ]
@@ -3445,6 +3502,14 @@ def _read_csv_file(path: Path) -> list[dict[str, str]]:
         return []
     with path.open(newline="") as handle:
         return list(csv.DictReader(handle))
+
+
+def _read_first_csv_file(paths: list[Path]) -> list[dict[str, str]]:
+    for path in paths:
+        rows = _read_csv_file(path)
+        if rows:
+            return rows
+    return []
 
 
 def _known_object_row(obj: KnownObject) -> dict[str, str]:

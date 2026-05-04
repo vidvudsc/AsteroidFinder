@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
+import csv
 import shutil
 import textwrap
 import subprocess
@@ -60,6 +62,32 @@ def solve_image(
         downsample=downsample,
         max_sources=max_sources,
     )
+
+
+def write_plate_solutions_csv(solutions: Sequence[PlateSolution], path: str | Path) -> Path:
+    """Write one plate-solving QA row per solved frame."""
+
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["frame", "method", "solved_fits", "center_ra_deg", "center_dec_deg", "pixel_scale_arcsec_px"])
+        for solution in solutions:
+            image = load_image(solution.path)
+            height, width = image.data.shape
+            center_ra, center_dec = solution.wcs.pixel_to_world_values(width / 2, height / 2)
+            pixel_scale = _solution_pixel_scale_arcsec(solution.wcs)
+            writer.writerow(
+                [
+                    solution.path.name,
+                    solution.method,
+                    "" if solution.solved_fits is None else str(solution.solved_fits),
+                    f"{float(center_ra):.8f}",
+                    f"{float(center_dec):.8f}",
+                    "" if pixel_scale is None else f"{pixel_scale:.6f}",
+                ]
+            )
+    return output
 
 
 def _solve_with_astrometry_net(
@@ -154,6 +182,22 @@ def _solve_with_astrometry_net(
     if not wcs.has_celestial:
         raise RuntimeError(f"astrometry.net output has no celestial WCS: {solved_path}")
     return PlateSolution(path=path, wcs=wcs, solved_fits=solved_path, method="astrometry.net")
+
+
+def _solution_pixel_scale_arcsec(wcs: WCS) -> float | None:
+    try:
+        scales = wcs.proj_plane_pixel_scales()
+    except Exception:
+        return None
+    if len(scales) < 2:
+        return None
+    values = []
+    for scale in scales[:2]:
+        if hasattr(scale, "to_value"):
+            values.append(float(scale.to_value(u.arcsec)))
+        else:
+            values.append(float(scale) * 3600.0)
+    return float(np.mean(np.abs(values)))
 
 
 def _scale_arcsec_per_pixel(header: fits.Header | None) -> float | None:

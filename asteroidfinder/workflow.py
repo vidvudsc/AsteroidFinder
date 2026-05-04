@@ -7,6 +7,7 @@ from typing import Sequence
 from .alignment import AlignedFrame, align_images, stack_images
 from .calibration import calibrate_images
 from .io import save_fits, save_jpeg
+from .outputs import output_layout
 from .tracking import Track, track_moving_objects
 
 
@@ -26,6 +27,10 @@ class AsteroidWorkflowResult:
     tracks_path: Path
     alignment_report_path: Path
 
+    @property
+    def alignment_qa_path(self) -> Path:
+        return self.alignment_report_path
+
 
 def run_asteroid_workflow(
     paths: Sequence[str | Path],
@@ -44,10 +49,11 @@ def run_asteroid_workflow(
 
     if not paths:
         raise ValueError("No science images provided")
-    out_dir = Path(output_dir)
-    calibrated_dir = out_dir / "calibrated"
-    aligned_dir = out_dir / "aligned"
-    diff_dir = out_dir / "difference"
+    layout = output_layout(output_dir)
+    out_dir = layout.root
+    calibrated_dir = layout.calibrated_dir
+    aligned_dir = layout.aligned_dir
+    diff_dir = layout.difference_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     diff_dir.mkdir(parents=True, exist_ok=True)
 
@@ -66,7 +72,12 @@ def run_asteroid_workflow(
     else:
         working_paths = [Path(path) for path in paths]
 
-    aligned_frames = align_images(working_paths, output_dir=aligned_dir, crop_overlap=crop_overlap)
+    aligned_frames = align_images(
+        working_paths,
+        output_dir=aligned_dir,
+        qa_path=layout.alignment_qa_csv,
+        crop_overlap=crop_overlap,
+    )
     stack = stack_images(aligned_frames, method="median")
     stack_path = out_dir / "stack_median.fits"
     save_fits(stack, stack_path)
@@ -82,11 +93,21 @@ def run_asteroid_workflow(
         if make_preview:
             save_jpeg(diff, diff_dir / f"{frame.image.path.stem}_minus_stack.jpg")
 
-    tracks = track_moving_objects(working_paths, sigma=sigma, min_detections=min_detections)
-    tracks_path = out_dir / "tracks.csv"
+    aligned_paths = [
+        aligned_dir / f"{frame.image.path.stem}_aligned.fits"
+        for frame in aligned_frames
+        if (aligned_dir / f"{frame.image.path.stem}_aligned.fits").exists()
+    ]
+    tracking_paths = aligned_paths if aligned_paths else working_paths
+    tracks = track_moving_objects(
+        tracking_paths,
+        sigma=sigma,
+        min_detections=min_detections,
+        assume_aligned=bool(aligned_paths),
+    )
+    tracks_path = layout.tracks_csv
     write_tracks_csv(tracks, tracks_path)
-    alignment_report_path = out_dir / "alignment_report.csv"
-    write_alignment_report(aligned_frames, alignment_report_path)
+    alignment_report_path = layout.alignment_qa_csv
 
     return AsteroidWorkflowResult(
         aligned_frames=aligned_frames,

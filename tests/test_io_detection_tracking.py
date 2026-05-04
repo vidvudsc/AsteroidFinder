@@ -18,7 +18,7 @@ from asteroidfinder.astrometry_quality import (
     write_wcs_offset_corrections,
 )
 from asteroidfinder.calibration import build_persistent_hot_pixel_mask, calibrate_images_with_persistent_hot_pixels, remove_hot_pixels
-from asteroidfinder.diagnostics import plot_track_diagnostics
+from asteroidfinder.diagnostics import write_track_diagnostic_outputs
 from asteroidfinder.doctor import recommend_index_series, run_doctor
 from asteroidfinder.ephemeris import query_mpc_ephemeris_for_frames, write_mpc_ephemeris_csv
 from asteroidfinder.detection import detect_sources
@@ -537,13 +537,15 @@ def test_track_diagnostics_writes_png_and_summary(tmp_path: Path) -> None:
     paths = _synthetic_wcs_sequence(tmp_path)
     tracks = track_moving_objects(paths, sigma=5, min_detections=3)
 
-    written = plot_track_diagnostics(tracks, tmp_path / "diag")
+    written = write_track_diagnostic_outputs(tracks, tmp_path / "diag", frame_paths=paths)
 
     assert written
     assert written[0].exists()
     summary = (tmp_path / "diag" / "track_diagnostics.csv").read_text()
     assert "pixel_speed" in summary
     assert "sky_speed" in summary
+    assert (tmp_path / "diag" / "track_001_cutout.gif").exists()
+    assert (tmp_path / "diag" / "all_detected_tracks.png").exists()
 
 
 def test_doctor_reports_index_recommendation(tmp_path: Path) -> None:

@@ -24,7 +24,12 @@ from .calibration import (
     remove_hot_pixels,
 )
 from .detection import Source, detect_sources
-from .diagnostics import plot_track_diagnostics
+from .diagnostics import (
+    plot_track_diagnostics,
+    write_full_frame_tracks_png,
+    write_track_cutout_gifs,
+    write_track_diagnostic_outputs,
+)
 from .doctor import DoctorCheck, install_astrometry_indexes, recommend_index_series, run_doctor
 from .ephemeris import MpcEphemerisPrediction, query_mpc_ephemeris_for_frames, write_mpc_ephemeris_csv
 from .io import AstroImage, load_image, save_fits, save_jpeg
@@ -42,7 +47,8 @@ from .mpc import (
     write_detected_track_mpc,
     write_detected_track_observations_csv,
 )
-from .platesolve import PlateSolution, solve_image
+from .outputs import OutputLayout, output_layout
+from .platesolve import PlateSolution, solve_image, write_plate_solutions_csv
 from .photometry import Photometry, aperture_photometry
 from .tracking import Track, TrackDetection, track_aligned_frames, track_moving_objects
 from .workflow import AsteroidWorkflowResult, run_asteroid_workflow
@@ -62,6 +68,7 @@ __all__ = [
     "KnownObject",
     "KnownObjectPhotometry",
     "MpcEphemerisPrediction",
+    "OutputLayout",
     "Source",
     "Track",
     "TrackDetection",
@@ -103,4 +110,9 @@ __all__ = [
     "write_astrometry_quality_csv",
     "write_wcs_offset_corrected_fits",
     "write_wcs_offset_corrections",
+    "write_full_frame_tracks_png",
+    "write_plate_solutions_csv",
+    "write_track_cutout_gifs",
+    "write_track_diagnostic_outputs",
+    "output_layout",
 ]

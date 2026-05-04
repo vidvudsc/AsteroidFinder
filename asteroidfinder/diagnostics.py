@@ -5,7 +5,9 @@ from pathlib import Path
 from typing import Sequence
 
 import numpy as np
+from PIL import Image, ImageDraw
 
+from .io import load_image, stretch_to_uint8
 from .tracking import Track
 
 
@@ -45,6 +47,122 @@ def plot_track_diagnostics(
     if summary_rows:
         _write_summary(summary_rows, out_dir / f"{prefix}_diagnostics.csv")
     return written
+
+
+def write_track_diagnostic_outputs(
+    tracks: Sequence[Track],
+    output_dir: str | Path,
+    *,
+    frame_paths: Sequence[str | Path] | None = None,
+    frame_times_jd: Sequence[float] | None = None,
+    prefix: str = "track",
+    cutout_radius: int = 40,
+    cutout_scale: int = 4,
+) -> list[Path]:
+    """Write movement plots plus visual detection products for the tracks.
+
+    Outputs include:
+    - one matplotlib movement PNG per track
+    - one cutout blink GIF per track when frames are supplied
+    - one full-frame PNG overlay with all detected tracks when frames are supplied
+    """
+
+    written = plot_track_diagnostics(tracks, output_dir, frame_times_jd=frame_times_jd, prefix=prefix)
+    if frame_paths:
+        written.extend(
+            write_track_cutout_gifs(
+                tracks,
+                frame_paths,
+                output_dir,
+                radius=cutout_radius,
+                scale=cutout_scale,
+                prefix=prefix,
+            )
+        )
+        overlay = write_full_frame_tracks_png(tracks, frame_paths[0], output_dir)
+        if overlay is not None:
+            written.append(overlay)
+    return written
+
+
+def write_track_cutout_gifs(
+    tracks: Sequence[Track],
+    frame_paths: Sequence[str | Path],
+    output_dir: str | Path,
+    *,
+    radius: int = 40,
+    scale: int = 4,
+    prefix: str = "track",
+    duration_ms: int = 450,
+) -> list[Path]:
+    """Write one square blink GIF per detected track."""
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    paths = [Path(path) for path in frame_paths]
+    cache: dict[int, np.ndarray] = {}
+    written: list[Path] = []
+
+    for track_id, track in enumerate(tracks, start=1):
+        frames: list[Image.Image] = []
+        color = _color_for_index(track_id)
+        for detection in track.detections:
+            if detection.frame_index < 0 or detection.frame_index >= len(paths):
+                continue
+            preview = cache.get(detection.frame_index)
+            if preview is None:
+                preview = stretch_to_uint8(load_image(paths[detection.frame_index]).data)
+                cache[detection.frame_index] = preview
+            cutout = _square_cutout(preview, detection.source.x, detection.source.y, radius)
+            image = Image.fromarray(cutout, mode="L").convert("RGB")
+            if scale > 1:
+                image = image.resize((image.width * scale, image.height * scale), Image.Resampling.NEAREST)
+            draw = ImageDraw.Draw(image)
+            cx = image.width / 2
+            cy = image.height / 2
+            r = max(7, int(radius * scale * 0.18))
+            draw.ellipse((cx - r, cy - r, cx + r, cy + r), outline=color, width=max(2, scale))
+            draw.text((8, 6), f"AF{track_id:05d} f{detection.frame_index}", fill=color)
+            frames.append(image)
+        if frames:
+            path = out_dir / f"{prefix}_{track_id:03d}_cutout.gif"
+            frames[0].save(path, save_all=True, append_images=frames[1:], duration=duration_ms, loop=0)
+            written.append(path)
+    return written
+
+
+def write_full_frame_tracks_png(
+    tracks: Sequence[Track],
+    frame_path: str | Path,
+    output_dir: str | Path,
+    *,
+    filename: str = "all_detected_tracks.png",
+) -> Path | None:
+    """Write one full-frame overlay showing every detected moving track."""
+
+    if not tracks:
+        return None
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    preview = stretch_to_uint8(load_image(frame_path).data)
+    image = Image.fromarray(preview, mode="L").convert("RGB")
+    draw = ImageDraw.Draw(image)
+
+    for track_id, track in enumerate(tracks, start=1):
+        color = _color_for_index(track_id)
+        points = [(det.source.x, det.source.y) for det in track.detections]
+        if len(points) > 1:
+            draw.line(points, fill=color, width=2)
+        for x, y in points:
+            r = 12
+            draw.ellipse((x - r, y - r, x + r, y + r), outline=color, width=3)
+        if points:
+            x, y = points[0]
+            draw.text((x + 16, y - 16), f"AF{track_id:05d}", fill=color)
+
+    path = out_dir / filename
+    image.save(path)
+    return path
 
 
 def _track_arrays(track: Track, *, frame_times_jd: Sequence[float] | None) -> dict[str, np.ndarray | float | None | str]:
@@ -109,6 +227,35 @@ def _track_arrays(track: Track, *, frame_times_jd: Sequence[float] | None) -> di
         "sky_speed": sky_speed,
         "pa": pa,
     }
+
+
+def _square_cutout(data: np.ndarray, x: float, y: float, radius: int) -> np.ndarray:
+    size = radius * 2 + 1
+    output = np.zeros((size, size), dtype=np.uint8)
+    cx = int(round(x))
+    cy = int(round(y))
+    src_x0 = max(0, cx - radius)
+    src_x1 = min(data.shape[1], cx + radius + 1)
+    src_y0 = max(0, cy - radius)
+    src_y1 = min(data.shape[0], cy + radius + 1)
+    dst_x0 = src_x0 - (cx - radius)
+    dst_y0 = src_y0 - (cy - radius)
+    output[dst_y0 : dst_y0 + (src_y1 - src_y0), dst_x0 : dst_x0 + (src_x1 - src_x0)] = data[src_y0:src_y1, src_x0:src_x1]
+    return output
+
+
+def _color_for_index(index: int) -> tuple[int, int, int]:
+    colors = [
+        (56, 189, 248),
+        (52, 211, 153),
+        (251, 191, 36),
+        (248, 113, 113),
+        (167, 139, 250),
+        (244, 114, 182),
+        (45, 212, 191),
+        (250, 204, 21),
+    ]
+    return colors[(index - 1) % len(colors)]
 
 
 def _plot_one_track(plt: object, track_id: int, track: Track, points: dict[str, object], path: Path) -> None:

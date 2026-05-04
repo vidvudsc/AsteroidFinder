@@ -16,7 +16,7 @@ from .io import load_image, save_fits, save_jpeg
 from .photometry import aperture_photometry
 from .platesolve import solve_image
 from .tracking import track_moving_objects
-from .workflow import run_asteroid_workflow, write_alignment_report, write_tracks_csv
+from .workflow import run_asteroid_workflow, write_tracks_csv
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -254,11 +254,10 @@ def _solve(paths: list[str], args: argparse.Namespace) -> int:
 
 
 def _align(paths: list[str], args: argparse.Namespace) -> int:
-    frames = align_images(paths, output_dir=args.out)
+    report = args.report or (args.out / "alignment_qa.csv")
+    frames = align_images(paths, output_dir=args.out, qa_path=report)
     print(f"aligned {len(frames)} images into {args.out}")
-    report = args.report or (args.out / "alignment_report.csv")
-    write_alignment_report(frames, report)
-    print(f"alignment_report={report}")
+    print(f"alignment_qa={report}")
     if args.stack:
         stacked = stack_images(frames, method=args.stack)
         fits_path = args.out / f"stack_{args.stack}.fits"
@@ -342,7 +341,7 @@ def _asteroid_run(paths: list[str], args: argparse.Namespace) -> int:
     print(f"tracks={len(result.tracks)}")
     print(f"stack={result.stack_path}")
     print(f"tracks_csv={result.tracks_path}")
-    print(f"alignment_report={result.alignment_report_path}")
+    print(f"alignment_qa={result.alignment_qa_path}")
     return 0
 
 

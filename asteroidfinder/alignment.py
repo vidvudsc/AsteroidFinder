@@ -64,6 +64,7 @@ def align_images(
     *,
     reference: str | Path | None = None,
     output_dir: str | Path | None = None,
+    qa_path: str | Path | None = None,
     crop_overlap: bool = False,
     prefer_translation: bool = True,
     progress_callback: Callable[[int, int, str], None] | None = None,
@@ -121,7 +122,9 @@ def align_images(
                 origin_y=frame.origin_y,
             )
             save_fits(frame.data, out_dir / f"{frame.image.path.stem}_aligned.fits", header)
-        write_alignment_qa(result, out_dir / "alignment_qa.csv")
+        write_alignment_qa(result, qa_path if qa_path is not None else out_dir / "alignment_qa.csv")
+    elif qa_path is not None:
+        write_alignment_qa(result, qa_path)
     return result
 
 

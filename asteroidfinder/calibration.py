@@ -118,6 +118,7 @@ def calibrate_images_with_persistent_hot_pixels(
     paths: Sequence[str | Path],
     *,
     output_dir: str | Path | None = None,
+    diagnostic_dir: str | Path | None = None,
     hot_sigma: float = 25.0,
     neighbor_sigma: float = 6.0,
     min_center_neighbor_ratio: float = 2.0,
@@ -136,8 +137,11 @@ def calibrate_images_with_persistent_hot_pixels(
     done = 0
     grouped_paths = _group_paths_by_shape(all_paths)
     results = []
-    if output_dir is not None:
-        summary_path = Path(output_dir) / "hot_pixel_qa" / "hot_pixel_summary.csv"
+    diagnostic_base = Path(diagnostic_dir) if diagnostic_dir is not None else (
+        Path(output_dir) / "hot_pixel_qa" if output_dir is not None else None
+    )
+    if diagnostic_base is not None:
+        summary_path = diagnostic_base / "hot_pixel_summary.csv"
         if summary_path.exists():
             summary_path.unlink()
     for shape_paths in grouped_paths.values():
@@ -147,7 +151,7 @@ def calibrate_images_with_persistent_hot_pixels(
             neighbor_sigma=neighbor_sigma,
             min_center_neighbor_ratio=min_center_neighbor_ratio,
             min_frames=min_frames,
-            diagnostic_dir=None if output_dir is None else Path(output_dir) / "hot_pixel_qa",
+            diagnostic_dir=diagnostic_base,
             progress_callback=(
                 None
                 if progress_callback is None
