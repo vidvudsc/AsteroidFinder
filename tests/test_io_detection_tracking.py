@@ -1,16 +1,26 @@
 from __future__ import annotations
 
 from pathlib import Path
+import math
 
+import astropy.units as u
 import numpy as np
 from astropy.io import fits
 from astropy.table import Table
+from astropy.wcs import WCS
 import requests
 
 from asteroidfinder.alignment import align_images
+from asteroidfinder.astrometry_quality import (
+    GaiaReferenceSource,
+    measure_gaia_astrometry_quality,
+    write_astrometry_quality_csv,
+    write_wcs_offset_corrections,
+)
 from asteroidfinder.calibration import build_persistent_hot_pixel_mask, calibrate_images_with_persistent_hot_pixels, remove_hot_pixels
 from asteroidfinder.diagnostics import plot_track_diagnostics
 from asteroidfinder.doctor import recommend_index_series, run_doctor
+from asteroidfinder.ephemeris import query_mpc_ephemeris_for_frames, write_mpc_ephemeris_csv
 from asteroidfinder.detection import detect_sources
 from asteroidfinder.io import load_image, save_fits
 from asteroidfinder import known_objects as known_object_module
@@ -322,6 +332,102 @@ def test_align_images_writes_alignment_qa(tmp_path: Path) -> None:
     text = qa_path.read_text()
     assert "rms_error_px" in text
     assert "wcs-reproject" in text
+
+
+def test_aligned_output_header_shifts_crpix_after_crop() -> None:
+    from asteroidfinder.alignment import _aligned_output_header
+
+    reference = fits.Header()
+    reference["CTYPE1"] = "RA---TAN"
+    reference["CTYPE2"] = "DEC--TAN"
+    reference["CRPIX1"] = 60.0
+    reference["CRPIX2"] = 70.0
+    reference["CRVAL1"] = 100.0
+    reference["CRVAL2"] = 20.0
+    reference["CDELT1"] = -0.00028
+    reference["CDELT2"] = 0.00028
+
+    header = _aligned_output_header(None, reference, origin_x=3, origin_y=5)
+
+    assert header["CRPIX1"] == 57.0
+    assert header["CRPIX2"] == 65.0
+    assert header["AFCROPX"] == 3
+    assert header["AFCROPY"] == 5
+
+
+def test_gaia_astrometry_quality_measures_wcs_offset_and_writes_corrected_copy(tmp_path: Path) -> None:
+    reference_path = _synthetic_wcs_sequence(tmp_path)[0]
+    image = load_image(reference_path)
+    assert image.header is not None
+    reference_wcs = WCS(image.header)
+    sources = detect_sources(image.data, sigma=5, max_sources=8)
+    catalog = []
+    for index, source in enumerate(sources):
+        ra, dec = reference_wcs.pixel_to_world_values(source.x, source.y)
+        catalog.append(GaiaReferenceSource(str(index), float(ra), float(dec), 14.0 + index))
+
+    bad_header = image.header.copy()
+    dec = float(bad_header["CRVAL2"])
+    bad_header["CRVAL1"] = float(bad_header["CRVAL1"]) + 0.5 / 3600.0 / math.cos(math.radians(dec))
+    bad_header["CRVAL2"] = float(bad_header["CRVAL2"]) - 0.3 / 3600.0
+    bad_path = tmp_path / "bad_wcs.fits"
+    save_fits(image.data, bad_path, bad_header)
+
+    result = measure_gaia_astrometry_quality(
+        bad_path,
+        catalog_sources=catalog,
+        sigma=5,
+        match_radius_arcsec=2.0,
+    )
+
+    assert result.matched_sources >= 5
+    assert result.rms_residual_arcsec is not None
+    assert 0.5 < result.rms_residual_arcsec < 0.7
+    assert result.suggested_crval1_deg is not None
+    assert result.suggested_crval2_deg is not None
+    assert abs(result.suggested_crval1_deg - float(image.header["CRVAL1"])) < 1e-7
+    assert abs(result.suggested_crval2_deg - float(image.header["CRVAL2"])) < 1e-7
+
+    output_dir = tmp_path / "qa"
+    write_wcs_offset_corrections([result], output_dir)
+    write_astrometry_quality_csv([result], output_dir)
+
+    summary = output_dir / "astrometry_qa.csv"
+    corrected = output_dir / "wcs_corrected" / "bad_wcs_gaia_wcs.fits"
+    assert summary.exists()
+    assert corrected.exists()
+    assert "corrected_fits" in summary.read_text()
+
+
+def test_mpc_ephemeris_projects_target_positions_into_frames(tmp_path: Path, monkeypatch) -> None:
+    from astroquery.mpc import MPC
+
+    paths = _synthetic_wcs_sequence(tmp_path)
+    calls = []
+
+    def fake_get_ephemeris(target, *, location, start, step, number, proper_motion, proper_motion_unit):
+        calls.append((target, location, start, step, number, proper_motion, proper_motion_unit))
+        table = Table()
+        table["RA"] = np.array([100.0]) * u.deg
+        table["Dec"] = np.array([20.0]) * u.deg
+        table["V"] = [18.2]
+        table["dRA cos(Dec)"] = np.array([3.5]) * (u.arcsec / u.hour)
+        table["dDec"] = np.array([-1.25]) * (u.arcsec / u.hour)
+        return table
+
+    monkeypatch.setattr(MPC, "get_ephemeris", fake_get_ephemeris)
+
+    predictions = query_mpc_ephemeris_for_frames("6564", paths, location="I41")
+    csv_path = write_mpc_ephemeris_csv(predictions, tmp_path / "mpc_ephemeris.csv")
+
+    assert len(predictions) == len(paths)
+    assert len(calls) == len(paths)
+    assert all(call[0] == "6564" and call[1] == "I41" for call in calls)
+    assert all(58 <= item.x <= 60 and 58 <= item.y <= 60 for item in predictions)
+    assert predictions[0].v_mag == 18.2
+    assert predictions[0].ra_rate_arcsec_per_hour == 3.5
+    assert csv_path.exists()
+    assert "ra_rate_arcsec_per_hour" in csv_path.read_text()
 
 
 def test_align_images_ignores_isolated_hot_pixels_in_star_matching(tmp_path: Path) -> None:

@@ -3,10 +3,15 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import astropy.units as u
+from astropy.coordinates import EarthLocation
+
 from .alignment import align_images, stack_images
+from .astrometry_quality import run_gaia_astrometry_quality
 from .calibration import calibrate_images, make_master_frame
 from .detection import detect_sources
 from .doctor import install_astrometry_indexes, recommend_index_series, run_doctor
+from .ephemeris import query_mpc_ephemeris_for_frames, write_mpc_ephemeris_csv
 from .io import load_image, save_fits, save_jpeg
 from .photometry import aperture_photometry
 from .platesolve import solve_image
@@ -80,6 +85,24 @@ def main(argv: list[str] | None = None) -> int:
     track_p.add_argument("--assume-aligned", action="store_true", help="Skip internal star alignment and treat inputs as already aligned")
     track_p.add_argument("--max-sources", type=int, default=500)
 
+    qa_p = sub.add_parser("astrometry-qa", help="Measure WCS quality against Gaia DR3 and write residual CSVs")
+    qa_p.add_argument("paths", nargs="+")
+    qa_p.add_argument("--out", type=Path, default=Path("astrometry_qa"))
+    qa_p.add_argument("--sigma", type=float, default=5.0)
+    qa_p.add_argument("--match-radius", type=float, default=5.0, help="Gaia match radius in arcsec")
+    qa_p.add_argument("--mag-limit", type=float, default=20.0)
+    qa_p.add_argument("--no-corrected", action="store_true", help="Do not write CRVAL-offset corrected FITS copies")
+
+    eph_p = sub.add_parser("mpc-ephemeris", help="Query MPC ephemerides for one known target in solved frames")
+    eph_p.add_argument("target", help="Asteroid designation, number, or packed designation")
+    eph_p.add_argument("paths", nargs="+")
+    eph_p.add_argument("--out", type=Path, default=Path("mpc_ephemeris.csv"))
+    eph_p.add_argument("--location", default="500", help="MPC observatory code; ignored when lat/lon are supplied")
+    eph_p.add_argument("--lat", type=float, help="Observer latitude in degrees")
+    eph_p.add_argument("--lon", type=float, help="Observer longitude in degrees, east positive")
+    eph_p.add_argument("--elev", type=float, default=0.0, help="Observer elevation in meters")
+    eph_p.add_argument("--include-outside", action="store_true", help="Keep predictions outside the image footprint")
+
     run_p = sub.add_parser("asteroid-run", help="Calibrate, align, stack, difference, and track asteroids")
     run_p.add_argument("paths", nargs="+")
     run_p.add_argument("--out", type=Path, default=Path("asteroid_run"))
@@ -112,6 +135,10 @@ def main(argv: list[str] | None = None) -> int:
         return _align(args.paths, args)
     if args.command == "track":
         return _track(args.paths, args)
+    if args.command == "astrometry-qa":
+        return _astrometry_qa(args.paths, args)
+    if args.command == "mpc-ephemeris":
+        return _mpc_ephemeris(args.paths, args)
     if args.command == "asteroid-run":
         return _asteroid_run(args.paths, args)
     raise AssertionError(args.command)
@@ -254,6 +281,48 @@ def _track(paths: list[str], args: argparse.Namespace) -> int:
     )
     write_tracks_csv(tracks, args.out)
     print(f"wrote {len(tracks)} tracks to {args.out}")
+    return 0
+
+
+def _astrometry_qa(paths: list[str], args: argparse.Namespace) -> int:
+    results = run_gaia_astrometry_quality(
+        paths,
+        output_dir=args.out,
+        sigma=args.sigma,
+        match_radius_arcsec=args.match_radius,
+        mag_limit=args.mag_limit,
+        write_corrected=not args.no_corrected,
+    )
+    matched = [result for result in results if result.rms_residual_arcsec is not None]
+    print(f"astrometry_qa={args.out / 'astrometry_qa.csv'}")
+    print(f"astrometry_matches={args.out / 'astrometry_matches.csv'}")
+    if not args.no_corrected:
+        print(f"wcs_corrected={args.out / 'wcs_corrected'}")
+    if matched:
+        worst = max(matched, key=lambda result: result.rms_residual_arcsec or 0.0)
+        print(
+            "worst="
+            f"{worst.path.name} rms={worst.rms_residual_arcsec:.3f}arcsec "
+            f"matches={worst.matched_sources}"
+        )
+    else:
+        print("warning=no Gaia matches")
+    return 0
+
+
+def _mpc_ephemeris(paths: list[str], args: argparse.Namespace) -> int:
+    observer = None
+    if args.lat is not None and args.lon is not None:
+        observer = EarthLocation(lat=args.lat * u.deg, lon=args.lon * u.deg, height=args.elev * u.m)
+    predictions = query_mpc_ephemeris_for_frames(
+        args.target,
+        paths,
+        location=args.location,
+        observer_location=observer,
+        only_inside=not args.include_outside,
+    )
+    write_mpc_ephemeris_csv(predictions, args.out)
+    print(f"wrote {len(predictions)} ephemeris prediction(s) to {args.out}")
     return 0
 
 

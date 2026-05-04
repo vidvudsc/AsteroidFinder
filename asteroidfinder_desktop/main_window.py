@@ -52,6 +52,7 @@ from PySide6.QtWidgets import (
 )
 
 from asteroidfinder.alignment import align_images
+from asteroidfinder.astrometry_quality import run_gaia_astrometry_quality
 from asteroidfinder.calibration import calibrate_images_with_persistent_hot_pixels
 from asteroidfinder.diagnostics import plot_track_diagnostics
 from asteroidfinder.io import load_image
@@ -371,6 +372,8 @@ class MainWindow(QMainWindow):
         analysis_menu.addSeparator()
         analysis_menu.addAction("Hot Pixel QA", self.open_hot_pixel_qa)
         analysis_menu.addAction("Alignment QA", self.open_alignment_qa)
+        analysis_menu.addAction("Run Gaia Astrometry QA", self.run_astrometry_qa)
+        analysis_menu.addAction("Gaia Astrometry QA", self.open_astrometry_qa)
         analysis_menu.addAction("PNG Diagnostics", self.write_png_diagnostics)
         analysis_menu.addSeparator()
         analysis_menu.addAction("Submission Window", self.open_submission_window)
@@ -712,6 +715,19 @@ class MainWindow(QMainWindow):
             return solved
 
         self._start_worker("plate solve", solve_all)
+
+    def run_astrometry_qa(self) -> None:
+        paths = self._require_paths(prefer_solved=True)
+        if not paths:
+            return
+        self._start_worker(
+            "astrometry QA",
+            run_gaia_astrometry_quality,
+            paths,
+            output_dir=self._astrometry_qa_dir(),
+            match_radius_arcsec=5.0,
+            write_corrected=True,
+        )
 
     def run_alignment(self) -> None:
         paths = self._require_paths(prefer_solved=True)
@@ -1137,6 +1153,9 @@ class MainWindow(QMainWindow):
                 self.session.frames = [self._frame_info(path) for path in solved_paths]
                 self._populate_frames()
                 self._show_frame(0, keep_view=False)
+        elif name == "astrometry QA":
+            self._log_astrometry_qa()
+            self._open_qa_window("Gaia Astrometry QA", self._astrometry_qa_path(), self._astrometry_qa_dir(), mask_controls=False)
         elif name == "known objects":
             self.known_objects = list(result)  # type: ignore[arg-type]
             self._match_known_objects_to_tracks()
@@ -1383,6 +1402,13 @@ class MainWindow(QMainWindow):
             return
         self._open_qa_window("Alignment QA", path, path.parent, mask_controls=False)
 
+    def open_astrometry_qa(self) -> None:
+        path = self._astrometry_qa_path()
+        if not path.exists():
+            self._error("No Gaia astrometry QA", "Run Gaia Astrometry QA first.")
+            return
+        self._open_qa_window("Gaia Astrometry QA", path, path.parent, mask_controls=False)
+
     def _open_qa_window(self, title: str, csv_path: Path, folder: Path, *, mask_controls: bool) -> None:
         window = QaWindow(title, csv_path, folder, mask_controls=mask_controls, parent=self)
         window.destroyed.connect(lambda *_: self._forget_qa_window(window))
@@ -1398,6 +1424,12 @@ class MainWindow(QMainWindow):
 
     def _alignment_qa_path(self) -> Path:
         return self._output_dir() / "aligned" / "alignment_qa.csv"
+
+    def _astrometry_qa_dir(self) -> Path:
+        return self._output_dir() / "astrometry_qa"
+
+    def _astrometry_qa_path(self) -> Path:
+        return self._astrometry_qa_dir() / "astrometry_qa.csv"
 
     def _log_hot_pixel_qa(self) -> None:
         rows = _read_csv_file(self._hot_pixel_qa_dir() / "hot_pixel_summary.csv")
@@ -1428,6 +1460,25 @@ class MainWindow(QMainWindow):
             f"worst={worst.get('frame', '')} rms={worst.get('rms_error_px', '')} px "
             f"matches={worst.get('matched_sources', '')}"
         )
+
+    def _log_astrometry_qa(self) -> None:
+        rows = _read_csv_file(self._astrometry_qa_path())
+        measured = [row for row in rows if row.get("rms_residual_arcsec")]
+        if not measured:
+            self._log(f"Gaia Astrometry QA: no matched Gaia stars; see {self._astrometry_qa_dir()}")
+            return
+        worst = max(measured, key=lambda row: float(row.get("rms_residual_arcsec") or 0.0))
+        excellent = sum(1 for row in measured if row.get("quality") == "excellent")
+        good = sum(1 for row in measured if row.get("quality") == "good")
+        warning = sum(1 for row in measured if row.get("quality") == "warning")
+        bad = sum(1 for row in measured if row.get("quality") == "bad")
+        self._log(
+            "Gaia Astrometry QA: "
+            f"excellent={excellent}, good={good}, warning={warning}, bad={bad}, "
+            f"worst={worst.get('frame', '')} rms={worst.get('rms_residual_arcsec', '')}\" "
+            f"matches={worst.get('matched_sources', '')}"
+        )
+        self._log(f"Gaia WCS-corrected FITS written to {self._astrometry_qa_dir() / 'wcs_corrected'}")
 
     def _match_known_objects_to_tracks(self, *, radius_px: float = 20.0) -> None:
         self.track_known_matches = {}
@@ -1948,6 +1999,8 @@ def _initial_progress_total(name: str, args: tuple[Any, ...]) -> int | None:
         return count
     if name == "alignment":
         return count
+    if name == "astrometry QA":
+        return count
     return None
 
 
@@ -1955,7 +2008,7 @@ def _progress_bar_text(text: str) -> str:
     if not text:
         return "%p%"
     compact = text
-    for prefix in ("Scanning ", "Solving ", "Solved ", "Aligning ", "Aligned ", "Wrote "):
+    for prefix in ("Scanning ", "Solving ", "Solved ", "Aligning ", "Aligned ", "Gaia QA ", "Measured ", "Wrote "):
         if compact.startswith(prefix):
             compact = prefix + Path(compact[len(prefix) :]).name
             break

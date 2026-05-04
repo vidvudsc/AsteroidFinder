@@ -55,6 +55,8 @@ class AlignedFrame:
     method: str = "reference"
     rms_error: float | None = None
     matched_sources: int = 0
+    origin_x: int = 0
+    origin_y: int = 0
 
 
 def align_images(
@@ -112,20 +114,32 @@ def align_images(
         if progress_callback is not None:
             progress_callback(total, total, "Writing aligned FITS files")
         for frame in result:
-            header = _aligned_output_header(frame.image.header, reference_image.header)
+            header = _aligned_output_header(
+                frame.image.header,
+                reference_image.header,
+                origin_x=frame.origin_x,
+                origin_y=frame.origin_y,
+            )
             save_fits(frame.data, out_dir / f"{frame.image.path.stem}_aligned.fits", header)
         write_alignment_qa(result, out_dir / "alignment_qa.csv")
     return result
 
 
-def _aligned_output_header(frame_header: object | None, reference_header: object | None) -> object | None:
+def _aligned_output_header(
+    frame_header: object | None,
+    reference_header: object | None,
+    *,
+    origin_x: int = 0,
+    origin_y: int = 0,
+) -> object | None:
     """Use reference WCS for aligned pixels while preserving per-frame metadata."""
 
     if reference_header is None:
-        return frame_header.copy() if hasattr(frame_header, "copy") else None
+        header = frame_header.copy() if hasattr(frame_header, "copy") else None
+        return _shift_header_origin(header, origin_x=origin_x, origin_y=origin_y)
     header = reference_header.copy()
     if frame_header is None:
-        return header
+        return _shift_header_origin(header, origin_x=origin_x, origin_y=origin_y)
     for key in _FRAME_METADATA_KEYS:
         if key not in frame_header:
             continue
@@ -134,6 +148,18 @@ def _aligned_output_header(frame_header: object | None, reference_header: object
             header.comments[key] = frame_header.comments[key]
         except Exception:
             pass
+    return _shift_header_origin(header, origin_x=origin_x, origin_y=origin_y)
+
+
+def _shift_header_origin(header: object | None, *, origin_x: int, origin_y: int) -> object | None:
+    if header is None or (origin_x == 0 and origin_y == 0):
+        return header
+    if "CRPIX1" in header:
+        header["CRPIX1"] = float(header["CRPIX1"]) - origin_x
+    if "CRPIX2" in header:
+        header["CRPIX2"] = float(header["CRPIX2"]) - origin_y
+    header["AFCROPX"] = (int(origin_x), "AsteroidFinder crop origin x")
+    header["AFCROPY"] = (int(origin_y), "AsteroidFinder crop origin y")
     return header
 
 
@@ -194,6 +220,8 @@ def crop_to_common_overlap(frames: Sequence[AlignedFrame]) -> list[AlignedFrame]
                 frame.method,
                 frame.rms_error,
                 frame.matched_sources,
+                frame.origin_x + x0,
+                frame.origin_y + y0,
             )
         )
     return cropped
